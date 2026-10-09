@@ -155,6 +155,204 @@ GOMAXPROCS=2 go run ./go_async.go
 
 即使设为 `1`，仍然存在并发，输出顺序仍不保证。它**不限制 goroutine 总数，也不限制操作系统线程总数**。默认值受 Go 版本、CPU 可用性、容器配额等影响，通常不需要手动修改。
 
+
+
+### 5.4 runtime 包实例 
+
+在 `Day4` 目录可以运行两个当前可执行的文件：
+
+```bash
+go run ./go_runtime.go
+go run ./runtime/runtime_gomaxprocs.go
+```
+
+**这里采用“按文件运行”的学习方式。** `go_async.go` 和 `go_runtime.go` 都定义了 `main`，不能一起作为同一个包编译；`runtime/` 下还有注释掉的文件和未使用的导入。因此，当前不应使用 `go run .`、`go run ./runtime` 或 `go test ./...` 来验证这些示例。
+
+
+
+### 5.5 runtime.Gosched：让出执行机会，不是等待完成
+
+`runtime.Gosched()` 让当前 goroutine 主动让出执行机会，允许其他 goroutine 运行。当前 goroutine 不会因此结束，也不是等待某个事件才重新就绪；调度器后续会让它继续执行。
+
+原示例的关键代码是：
+
+```go
+for i := 0; i < 2; i++ {
+    runtime.Gosched()
+    fmt.Println("hello")
+}
+```
+
+理解时要注意：
+
+- `Gosched()` 不指定下一个运行哪个 goroutine，也不保证 `world` 必须先于 `hello` 输出。
+- 它不会等待所有其他 goroutine 运行完；调用两次也不等于子 goroutine 已完成两次循环。
+- 主 goroutine 仍可能先返回，导致子 goroutine 来不及完成。一次运行输出完整，不代表程序有完成保证。
+- Go 已支持抢占式调度，业务代码一般不需要靠反复调用 `Gosched()` 才能实现并发。
+
+保留调度实验，同时用 `WaitGroup` 保证任务完成：
+
+```go
+package main
+
+import (
+    "fmt"
+    "runtime"
+    "sync"
+)
+
+func main() {
+    var wg sync.WaitGroup
+    wg.Add(1)
+    go func(s string) {
+        defer wg.Done()
+        for i := 0; i < 2; i++ {
+            fmt.Println(s)
+        }
+    }("world")
+
+    for i := 0; i < 2; i++ {
+        runtime.Gosched()
+        fmt.Println("hello")
+    }
+    wg.Wait()
+}
+```
+
+该版本保证输出两个 `world`、两个 `hello`，但不保证两者的交错顺序。去掉 `Gosched()` 后，`WaitGroup` 仍能保证子任务完成。
+
+### 5.6 runtime.Goexit：结束当前 goroutine
+
+`runtime.Goexit()` 会终止**调用它的 goroutine**，并在结束前执行该 goroutine 中已经登记的 `defer`。它不会终止其他 goroutine，也不是“只退出当前函数”。
+
+结合新增的 [`runtime/runtime_goexit.go`](./runtime/runtime_goexit.go)，核心执行过程是：
+
+1. 外层函数登记 `defer fmt.Println("A.defer")`。
+2. 内层函数登记 `defer fmt.Println("B.defer")`。
+3. 调用 `runtime.Goexit()`，开始结束当前 goroutine。
+4. 后面的 `defer fmt.Println("C.defer")` 尚未执行到，**没有登记**，因此不会输出 `C.defer`。
+5. 按调用栈展开顺序先输出 `B.defer`，再输出 `A.defer`；普通语句 `fmt.Println("B")`、`fmt.Println("A")` 都不会执行。
+
+原代码末尾的 `for {}` 只会让主 goroutine 不断空转，程序不会正常结束。可以改成下面的完整版本，用 `WaitGroup` 等待退出过程：
+
+```go
+package main
+
+import (
+    "fmt"
+    "runtime"
+    "sync"
+)
+
+func stop() {
+    runtime.Goexit()
+}
+
+func main() {
+    var wg sync.WaitGroup
+    wg.Add(1)
+    go func() {
+        defer wg.Done() // 最先登记，最后执行，保证其他清理先完成。
+        defer fmt.Println("A.defer")
+        func() {
+            defer fmt.Println("B.defer")
+            stop() // 内部调用 Goexit，效果跨越函数调用层级。
+            defer fmt.Println("C.defer") // 不会执行到，也就不会登记。
+            fmt.Println("B")
+        }()
+        fmt.Println("A")
+    }()
+    wg.Wait()
+    fmt.Println("main done")
+}
+```
+
+预期输出固定为：
+
+```text
+B.defer
+A.defer
+main done
+```
+
+这里将退出操作封装到 `stop()`，也便于实验：如果将其函数体改为普通 `return`，只会从 `stop` 返回，随后会依次输出 `B`、`C.defer`、`B.defer`、`A`、`A.defer`、`main done`。这与结束整个 goroutine 完全不同。
+
+另外两个边界：
+
+- `Goexit()` **不是 panic**。若 deferred 函数中调用 `recover()`，针对这次 `Goexit` 得到的是 `nil`，不能“捕获退出”并继续执行后续代码。
+- 在主 goroutine 中调用 `Goexit()` 不等于 `main` 正常返回：其他 goroutine 仍会运行；若其他 goroutine 也全部结束，程序会因没有 goroutine 可继续执行而报错退出。不要用它代替主函数中的等待与正常返回。
+
+一般业务函数优先使用 `return` 结束自身；需要协作取消任务时使用 context。`Goexit()` 不能通过 goroutine ID 去终止另一个 goroutine。
+
+### 5.7 GOMAXPROCS 示例：限制并行度，不保证交替输出
+
+新增的 [`runtime/runtime_gomaxprocs.go`](./runtime/runtime_gomaxprocs.go) 启动 `a()`、`b()`，各输出编号 `1` 到 `9`：循环条件是 `i < 10`，因此每个函数输出 **9 行**。
+
+```go
+runtime.GOMAXPROCS(2)
+go a()
+go b()
+time.Sleep(time.Second)
+```
+
+这段代码中：
+
+- `2` 表示最多两个线程同时执行普通 Go 代码，不表示“创建两个 goroutine”，也不保证两个任务一定并行。
+- `GOMAXPROCS(1)` 下两个任务仍可并发推进；不能据此推断一定先完整输出 A 再输出 B。
+- `GOMAXPROCS(2)` 下也可能出现大量连续的 A 或 B，而不是严格交替。`fmt.Println` 涉及格式化与 I/O，不适合用输出顺序判断 CPU 并行度或性能提升。
+- `time.Sleep(time.Second)` 只暂停主 goroutine；不能证明一秒内两个任务一定结束。
+- 源码显式调用 `GOMAXPROCS(2)`，会覆盖启动时的设置。因此直接执行 `GOMAXPROCS=1 go run ./runtime/runtime_gomaxprocs.go`，任务启动时使用的仍是 `2`。
+
+下面的版本去掉硬编码设置，让环境变量控制并行度，并用 `WaitGroup` 等待：
+
+```go
+package main
+
+import (
+    "fmt"
+    "runtime"
+    "sync"
+)
+
+func main() {
+    fmt.Println("GOMAXPROCS:", runtime.GOMAXPROCS(0))
+    var wg sync.WaitGroup
+    for _, name := range []string{"A", "B"} {
+        wg.Add(1)
+        go func(label string) {
+            defer wg.Done()
+            for i := 1; i < 10; i++ {
+                fmt.Println(label, i)
+            }
+        }(name)
+    }
+    wg.Wait()
+}
+```
+
+保存为上述独立示例后可对比运行：
+
+```bash
+GOMAXPROCS=1 go run ./examples/gomaxprocs
+GOMAXPROCS=2 go run ./examples/gomaxprocs
+```
+
+两次都应输出一行配置和 18 行任务结果；每个任务内部编号递增，A、B 之间的顺序不固定。比较性能时应改用足够大的 CPU 密集型任务和基准测试，而不是比较打印耗时。
+
+### 5.8 几种“让出、等待、退出”的区别
+
+| 操作 | 对当前 goroutine 的影响 | 是否执行已登记的 defer | 能否保证其他任务完成 |
+| --- | --- | --- | --- |
+| `runtime.Gosched()` | 主动让出执行机会，之后继续 | 不会因让出而执行 | 不能 |
+| `time.Sleep(d)`（`d > 0`） | 暂停至少指定时长，之后等待调度继续 | 不会因休眠而执行 | 不能 |
+| `wg.Wait()` | 等待任务计数归零 | 不会因等待而执行 | 只保证正确登记且遵循约定的任务完成 |
+| `return` | 返回当前函数；入口函数返回时该 goroutine 结束 | 执行当前函数的 defer | 不能 |
+| `runtime.Goexit()` | 结束当前 goroutine，展开其调用栈 | 执行该 goroutine 已登记的 defer | 不能 |
+| `panic(...)` | 开始 panic 栈展开；未恢复会终止程序 | 执行发生 panic 的 goroutine 中的 defer | 不能 |
+| `os.Exit(code)` | 立即退出整个进程 | 不执行 defer | 不能 |
+
+`main` 正常返回会先执行它自己的 `defer`，但程序随后退出，不会等待其他 goroutine 的 `defer`。不要把“当前函数返回”“当前 goroutine 退出”和“整个进程退出”混为一谈。
+
 ## 6. channel：在 goroutine 之间通信
 
 channel 是带类型的通信通道，既可以传递数据，也可以建立同步关系。
@@ -332,6 +530,9 @@ channel 适合传递数据、结果或转移任务所有权；锁适合保护共
 | 主程序提前结束 | `main` 不会等待其他 goroutine；使用 `WaitGroup` 等同步机制 |
 | 输出顺序不稳定 | 调度顺序不确定；需要顺序时显式设计协调机制 |
 | 用 Sleep 等待完成 | 依赖耗时猜测，不可靠；改用完成通知 |
+| 把 Gosched 当作同步 | 让出执行机会不代表其他任务完成；用 WaitGroup 或 channel |
+| 用空 `for {}` 保活 | 忙等消耗 CPU，且没有退出条件；使用明确的阻塞等待 |
+| 把 Goexit 当作 return | Goexit 会结束整个当前 goroutine，外层普通语句也不会继续执行 |
 | goroutine 泄漏 | 通道、锁或 I/O 等待永远无法结束；设计退出路径、超时与取消 |
 | channel 死锁 | 例如同一个 goroutine 向无缓冲 channel 发送后才接收；检查收发是否能配对 |
 | 等待与收集结果互相卡住 | 主 goroutine 先 `Wait()`，工作 goroutine 却阻塞在发送结果、无法 `Done()`；应并发接收结果 |
@@ -345,7 +546,7 @@ channel 适合传递数据、结果或转移任务所有权；锁适合保护共
 
 1. 先明确每个 goroutine 的启动者、退出条件以及由谁等待它。
 2. 明确每个 channel 的发送方、接收方和关闭方。
-3. 使用 `go run -race ./go_async.go`；有测试时可在本目录执行 `go test -race .`。
+3. 当前示例按文件检查，例如 `go run -race ./go_async.go`、`go run -race ./go_runtime.go`、`go run -race ./runtime/runtime_gomaxprocs.go`。后续将示例整理为独立目录并添加测试后，再对对应包执行 `go test -race`；不要在当前含多个 `main` 的目录直接测试整个包。
 4. race detector 只能发现实际运行路径中的竞争，未报告不代表一定安全；它也不能代替死锁或泄漏分析。
 5. 区分数据竞争与业务逻辑错误：没有数据竞争，也可能因错误的执行顺序得到错误结果。
 
@@ -358,6 +559,9 @@ channel 适合传递数据、结果或转移任务所有权；锁适合保护共
 3. 在计数器示例中临时移除锁，使用 `-race` 观察报告，再恢复同步保护。
 4. 实现固定 3 个 worker 处理 10 个任务：发送结束后关闭任务通道，等待 worker 结束，再关闭结果通道；主 goroutine 同时消费结果，避免互相等待。
 5. 为 worker 增加 context 取消，并确保发送方、worker 和结果接收方都能退出。
+6. 运行第 5.5 节的可靠同步版本，再去掉 `Gosched()`，解释为什么两种情况下都能保证输出完整，但不能保证交错顺序。
+7. 将第 5.6 节的 `stop()` 改为普通 `return`，预测并验证输出；再把 `C.defer` 的登记移到 `stop()` 之前，观察区别。
+8. 用环境变量分别设置第 5.7 节示例的并行度，解释为什么仅看 A、B 的打印顺序无法证明是否并行。
 
 记住四个问题：**谁执行（goroutine）、谁调度（GMP）、如何通信和保护数据（channel / 锁）、如何结束和等待（context / WaitGroup）**。
 
@@ -369,7 +573,12 @@ channel 适合传递数据、结果或转移任务所有权；锁适合保护共
 - [Go 语言规范：Channel types](https://go.dev/ref/spec#Channel_types)
 - [sync 包](https://pkg.go.dev/sync)
 - [context 包](https://pkg.go.dev/context)
-- [runtime 包与 GOMAXPROCS](https://pkg.go.dev/runtime#GOMAXPROCS)
+- [runtime.Gosched](https://pkg.go.dev/runtime#Gosched)
+- [runtime.Goexit](https://pkg.go.dev/runtime#Goexit)
+- [runtime.GOMAXPROCS](https://pkg.go.dev/runtime#GOMAXPROCS)
+- [runtime.NumCPU](https://pkg.go.dev/runtime#NumCPU)
+- [runtime.SetDefaultGOMAXPROCS](https://pkg.go.dev/runtime#SetDefaultGOMAXPROCS)
+- [Go 1.25：容器感知的 GOMAXPROCS](https://go.dev/doc/go1.25#container-aware-gomaxprocs)
 - [Go 内存模型](https://go.dev/ref/mem)
 - [数据竞争检测器](https://go.dev/doc/articles/race_detector)
 - [Go Concurrency Patterns: Pipelines and cancellation](https://go.dev/blog/pipelines)
