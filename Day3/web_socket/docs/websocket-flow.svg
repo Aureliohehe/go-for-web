@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="2050" viewBox="0 0 1240 2050" role="img" aria-labelledby="title desc">
+<title id="title">WebSocket 聊天室：连接、登录与消息广播</title><desc id="desc">蓝色：服务端连接处理   绿色：浏览器   紫色：Hub / 广播   黄色：分支判断；退出逻辑见另一张图。</desc>
+<defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/></marker>
+</defs>
+<style>
+text { font-family: "Noto Sans CJK SC", "Microsoft YaHei", "Droid Sans Fallback", sans-serif; fill: #1e293b; font-size: 17px; }
+.title {font-size: 29px; font-weight: bold;}
+.subtitle {font-size: 16px; fill: #64748b;}
+.edge {fill: none; stroke: #64748b; stroke-width: 2; marker-end: url(#arrow); stroke-linejoin: round;}
+.label {font-size: 15px; paint-order: stroke; stroke: #f8fafc; stroke-width: 6px; stroke-linejoin: round;}
+</style>
+<rect width="100%" height="100%" fill="#f8fafc"/>
+<text x="40" y="48" class="title">WebSocket 聊天室：连接、登录与消息广播</text>
+<text x="40" y="80" class="subtitle">蓝色：服务端连接处理   绿色：浏览器   紫色：Hub / 广播   黄色：分支判断；退出逻辑见另一张图。</text>
+<path class="edge" d="M 620 183 L 620 217"/>
+<path class="edge" d="M 750 150 L 980 150 L 980 217"/>
+<path class="edge" d="M 620 283 L 620 337"/>
+<path class="edge" d="M 250 283 L 250 370 L 490 370"/>
+<path class="edge" d="M 620 403 L 620 440"/>
+<path class="edge" d="M 740 490 L 850 490"/><text x="795" y="478" class="label" text-anchor="middle">否</text>
+<path class="edge" d="M 620 540 L 620 587"/><text x="642" y="568" class="label" text-anchor="middle">是</text>
+<path class="edge" d="M 620 653 L 620 707"/>
+<path class="edge" d="M 750 740 L 850 740"/>
+<path class="edge" d="M 620 773 L 620 827"/>
+<path class="edge" d="M 980 773 L 980 947"/>
+<path class="edge" d="M 750 860 L 810 860 L 810 980 L 850 980"/><text x="845" y="849" class="label" text-anchor="middle">写协程</text>
+<path class="edge" d="M 620 893 L 620 1257"/><text x="653" y="1170" class="label" text-anchor="middle">读循环</text>
+<path class="edge" d="M 850 980 L 380 980"/><text x="540" y="966" class="label" text-anchor="middle">WebSocket 文本消息</text>
+<path class="edge" d="M 250 1013 L 250 1070"/>
+<path class="edge" d="M 250 1170 L 250 1257"/><text x="300" y="1220" class="label" text-anchor="middle">handshake</text>
+<path class="edge" d="M 130 1120 L 90 1120 L 90 1437"/><text x="90" y="1385" class="label" text-anchor="middle">login / logout</text>
+<path class="edge" d="M 370 1120 L 430 1120 L 430 1380 L 360 1380 L 360 1437"/><text x="393" y="1368" class="label" text-anchor="middle">user</text>
+<path class="edge" d="M 380 1290 L 490 1290"/>
+<path class="edge" d="M 620 1323 L 620 1385"/>
+<path class="edge" d="M 547 1467 L 560 1467 L 560 1587"/><text x="588" y="1535" class="label" text-anchor="middle">login</text>
+<path class="edge" d="M 765 1440 L 860 1440 L 860 1587"/><text x="883" y="1515" class="label" text-anchor="middle">user</text>
+<path class="edge" d="M 560 1653 L 560 1695 L 710 1695 L 710 1717"/>
+<path class="edge" d="M 860 1653 L 860 1695 L 710 1695 L 710 1717"/>
+<path class="edge" d="M 710 1783 L 710 1827"/>
+<path class="edge" d="M 870 1860 L 1170 1860 L 1170 980 L 1110 980"/><text x="1170" y="1390" class="label" text-anchor="middle">循环发送</text>
+<path class="edge" d="M 380 1750 L 425 1750 L 425 1350 L 620 1350 L 620 1323"/><text x="425" y="1590" class="label" text-anchor="middle">user 消息</text>
+<path class="edge" d="M 710 1893 L 710 1970 L 410 1970"/><text x="560" y="1958" class="label" text-anchor="middle">队列已满</text>
+<rect x="490.0" y="117.0" width="260" height="66" rx="12" fill="#eff6ff" stroke="#60a5fa" stroke-width="2"/><text x="620" y="156.0" text-anchor="middle">启动 server.go</text>
+<rect x="850.0" y="217.0" width="260" height="66" rx="12" fill="#f5f3ff" stroke="#a78bfa" stroke-width="2"/><text x="980" y="256.0" text-anchor="middle">启动 h.run() 协程</text>
+<rect x="490.0" y="217.0" width="260" height="66" rx="12" fill="#eff6ff" stroke="#60a5fa" stroke-width="2"/><text x="620" y="256.0" text-anchor="middle">监听 127.0.0.1:8080</text>
+<rect x="120.0" y="217.0" width="260" height="66" rx="12" fill="#ecfdf5" stroke="#34d399" stroke-width="2"/><text x="250" y="244.0" text-anchor="middle">打开 local.html</text><text x="250" y="268.0" text-anchor="middle">输入用户名，连接 /ws</text>
+<rect x="490.0" y="337.0" width="260" height="66" rx="12" fill="#eff6ff" stroke="#60a5fa" stroke-width="2"/><text x="620" y="364.0" text-anchor="middle">myws 处理请求</text><text x="620" y="388.0" text-anchor="middle">调用 wu.Upgrade()</text>
+<polygon points="620,440.0 740.0,490 620,540.0 500.0,490" fill="#fffbeb" stroke="#fbbf24" stroke-width="2"/><text x="620" y="496.0" text-anchor="middle">升级成功？</text>
+<rect x="850.0" y="457.0" width="260" height="66" rx="12" fill="#fff1f2" stroke="#fb7185" stroke-width="2"/><text x="980" y="496.0" text-anchor="middle">结束请求</text>
+<rect x="490.0" y="587.0" width="260" height="66" rx="12" fill="#eff6ff" stroke="#60a5fa" stroke-width="2"/><text x="620" y="614.0" text-anchor="middle">创建 connection</text><text x="620" y="638.0" text-anchor="middle">创建 sc 队列（容量 256）</text>
+<rect x="490.0" y="707.0" width="260" height="66" rx="12" fill="#f5f3ff" stroke="#a78bfa" stroke-width="2"/><text x="620" y="746.0" text-anchor="middle">通过 h.r 注册连接</text>
+<rect x="850.0" y="707.0" width="260" height="66" rx="12" fill="#f5f3ff" stroke="#a78bfa" stroke-width="2"/><text x="980" y="734.0" text-anchor="middle">Hub 保存连接</text><text x="980" y="758.0" text-anchor="middle">将 handshake 放入 sc</text>
+<rect x="490.0" y="827.0" width="260" height="66" rx="12" fill="#eff6ff" stroke="#60a5fa" stroke-width="2"/><text x="620" y="854.0" text-anchor="middle">启动 writer 协程</text><text x="620" y="878.0" text-anchor="middle">reader 开始读取客户端消息</text>
+<rect x="850.0" y="947.0" width="260" height="66" rx="12" fill="#eff6ff" stroke="#60a5fa" stroke-width="2"/><text x="980" y="974.0" text-anchor="middle">writer 从 sc 取出消息</text><text x="980" y="998.0" text-anchor="middle">WriteMessage 发送至浏览器</text>
+<rect x="120.0" y="947.0" width="260" height="66" rx="12" fill="#ecfdf5" stroke="#34d399" stroke-width="2"/><text x="250" y="974.0" text-anchor="middle">浏览器 ws.onmessage</text><text x="250" y="998.0" text-anchor="middle">解析收到的 JSON</text>
+<polygon points="250,1070.0 370.0,1120 250,1170.0 130.0,1120" fill="#fffbeb" stroke="#fbbf24" stroke-width="2"/><text x="250" y="1126.0" text-anchor="middle">消息类型？</text>
+<rect x="120.0" y="1257.0" width="260" height="66" rx="12" fill="#ecfdf5" stroke="#34d399" stroke-width="2"/><text x="250" y="1284.0" text-anchor="middle">发送 login 消息</text><text x="250" y="1308.0" text-anchor="middle">content 为用户名</text>
+<rect x="10.0" y="1437.0" width="160" height="66" rx="12" fill="#ecfdf5" stroke="#34d399" stroke-width="2"/><text x="90" y="1464.0" text-anchor="middle">更新在线列表</text><text x="90" y="1488.0" text-anchor="middle">显示上下线提示</text>
+<rect x="270.0" y="1437.0" width="180" height="66" rx="12" fill="#ecfdf5" stroke="#34d399" stroke-width="2"/><text x="360" y="1476.0" text-anchor="middle">显示聊天消息</text>
+<rect x="490.0" y="1257.0" width="260" height="66" rx="12" fill="#eff6ff" stroke="#60a5fa" stroke-width="2"/><text x="620" y="1284.0" text-anchor="middle">reader 读取消息</text><text x="620" y="1308.0" text-anchor="middle">JSON 解码</text>
+<polygon points="620,1385.0 765.0,1440 620,1495.0 475.0,1440" fill="#fffbeb" stroke="#fbbf24" stroke-width="2"/><text x="620" y="1446.0" text-anchor="middle">客户端消息类型？</text>
+<rect x="440.0" y="1587.0" width="240" height="66" rx="12" fill="#eff6ff" stroke="#60a5fa" stroke-width="2"/><text x="560" y="1614.0" text-anchor="middle">login：记录用户</text><text x="560" y="1638.0" text-anchor="middle">更新在线列表</text>
+<rect x="740.0" y="1587.0" width="240" height="66" rx="12" fill="#eff6ff" stroke="#60a5fa" stroke-width="2"/><text x="860" y="1614.0" text-anchor="middle">user：序列化</text><text x="860" y="1638.0" text-anchor="middle">聊天消息</text>
+<rect x="580.0" y="1717.0" width="260" height="66" rx="12" fill="#f5f3ff" stroke="#a78bfa" stroke-width="2"/><text x="710" y="1756.0" text-anchor="middle">通过 h.b 请求广播</text>
+<rect x="550.0" y="1827.0" width="320" height="66" rx="12" fill="#f5f3ff" stroke="#a78bfa" stroke-width="2"/><text x="710" y="1854.0" text-anchor="middle">Hub 遍历所有连接</text><text x="710" y="1878.0" text-anchor="middle">放入各连接的 sc 队列</text>
+<rect x="120.0" y="1717.0" width="260" height="66" rx="12" fill="#ecfdf5" stroke="#34d399" stroke-width="2"/><text x="250" y="1744.0" text-anchor="middle">用户输入聊天内容</text><text x="250" y="1768.0" text-anchor="middle">发送 user 消息</text>
+<rect x="90.0" y="1937.0" width="320" height="66" rx="12" fill="#fff1f2" stroke="#fb7185" stroke-width="2"/><text x="250" y="1964.0" text-anchor="middle">队列已满：移除慢连接</text><text x="250" y="1988.0" text-anchor="middle">关闭它的 sc 队列</text>
+</svg>

@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="770" viewBox="0 0 1280 770" role="img" aria-labelledby="title desc">
+<title id="title">WebSocket 聊天室：断开连接处理</title><desc id="desc">红色表示当前代码的问题路径；绿色表示建议的清理流程（尚未修改业务代码）。</desc>
+<defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/></marker>
+</defs>
+<style>
+text { font-family: "Noto Sans CJK SC", "Microsoft YaHei", "Droid Sans Fallback", sans-serif; fill: #1e293b; font-size: 17px; }
+.title {font-size: 29px; font-weight: bold;}
+.subtitle {font-size: 16px; fill: #64748b;}
+.edge {fill: none; stroke: #64748b; stroke-width: 2; marker-end: url(#arrow); stroke-linejoin: round;}
+.label {font-size: 15px; paint-order: stroke; stroke: #f8fafc; stroke-width: 6px; stroke-linejoin: round;}
+</style>
+<rect width="100%" height="100%" fill="#f8fafc"/>
+<text x="40" y="48" class="title">WebSocket 聊天室：断开连接处理</text>
+<text x="40" y="80" class="subtitle">红色表示当前代码的问题路径；绿色表示建议的清理流程（尚未修改业务代码）。</text>
+<path class="edge" d="M 240 213 L 240 297"/>
+<path class="edge" d="M 240 363 L 240 437"/>
+<path class="edge" d="M 240 503 L 240 595"/>
+<path class="edge" d="M 405 180 L 745 180" stroke-dasharray="7 5"/><text x="575" y="166" class="label" text-anchor="middle">正确设计</text>
+<path class="edge" d="M 920 213 L 920 277"/>
+<path class="edge" d="M 920 343 L 920 407"/>
+<path class="edge" d="M 920 473 L 920 547"/>
+<rect x="75.0" y="147.0" width="330" height="66" rx="12" fill="#eff6ff" stroke="#60a5fa" stroke-width="2"/><text x="240" y="174.0" text-anchor="middle">读取失败 / 连接断开</text><text x="240" y="198.0" text-anchor="middle">或收到 logout</text>
+<rect x="75.0" y="297.0" width="330" height="66" rx="12" fill="#fff1f2" stroke="#fb7185" stroke-width="2"/><text x="240" y="324.0" text-anchor="middle">当前代码发送到 h.r</text><text x="240" y="348.0" text-anchor="middle">错误：把注销当成注册</text>
+<rect x="75.0" y="437.0" width="330" height="66" rx="12" fill="#fff1f2" stroke="#fb7185" stroke-width="2"/><text x="240" y="464.0" text-anchor="middle">Hub 再次注册连接</text><text x="240" y="488.0" text-anchor="middle">再次向 sc 放入 handshake</text>
+<rect x="40.0" y="595.0" width="400" height="90" rx="12" fill="#fff1f2" stroke="#fb7185" stroke-width="2"/><text x="240" y="634.0" text-anchor="middle">连接可能残留、writer 无法退出</text><text x="240" y="658.0" text-anchor="middle">活跃客户端可能再次登录</text>
+<rect x="745.0" y="147.0" width="350" height="66" rx="12" fill="#ecfdf5" stroke="#34d399" stroke-width="2"/><text x="920" y="174.0" text-anchor="middle">建议：退出读取循环</text><text x="920" y="198.0" text-anchor="middle">统一执行一次清理</text>
+<rect x="745.0" y="277.0" width="350" height="66" rx="12" fill="#ecfdf5" stroke="#34d399" stroke-width="2"/><text x="920" y="304.0" text-anchor="middle">更新在线用户列表</text><text x="920" y="328.0" text-anchor="middle">广播正确的 logout 通知</text>
+<rect x="745.0" y="407.0" width="350" height="66" rx="12" fill="#ecfdf5" stroke="#34d399" stroke-width="2"/><text x="920" y="434.0" text-anchor="middle">发送到 h.u</text><text x="920" y="458.0" text-anchor="middle">Hub 删除连接并关闭 sc</text>
+<rect x="745.0" y="547.0" width="350" height="66" rx="12" fill="#ecfdf5" stroke="#34d399" stroke-width="2"/><text x="920" y="574.0" text-anchor="middle">writer 结束</text><text x="920" y="598.0" text-anchor="middle">关闭 WebSocket 连接</text>
+<rect x="725.0" y="667.0" width="390" height="66" rx="12" fill="#fffbeb" stroke="#fbbf24" stroke-width="2"/><text x="920" y="694.0" text-anchor="middle">首次连接仍使用 h.r 注册</text><text x="920" y="718.0" text-anchor="middle">避免重复注销和重复下线通知</text>
+</svg>
