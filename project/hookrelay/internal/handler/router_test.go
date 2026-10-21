@@ -43,3 +43,48 @@ func TestHealthChecks(t *testing.T) {
 		})
 	}
 }
+
+func TestUnknownRoute(t *testing.T) {
+	router := NewRouter(func(ctx context.Context) error {
+		t.Fatal("未知路径不应调用数据库检查")
+		return nil
+	})
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/not-found", nil)
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", response.Code)
+	}
+}
+
+func TestReadinessRecovery(t *testing.T) {
+	dbErr := errors.New("database unavailable")
+	router := NewRouter(func(ctx context.Context) error {
+		return dbErr
+	})
+
+	check := func(wantCode int, wantBody string) {
+		t.Helper()
+
+		response := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+		router.ServeHTTP(response, request)
+
+		if response.Code != wantCode {
+			t.Fatalf("status = %d, want %d", response.Code, wantCode)
+		}
+		if strings.TrimSpace(response.Body.String()) != wantBody {
+			t.Fatalf("unexpected body: %s", response.Body.String())
+		}
+	}
+
+	check(http.StatusServiceUnavailable, `{"status":"not_ready"}`)
+
+	dbErr = nil
+	check(http.StatusOK, `{"status":"ready"}`)
+
+	dbErr = errors.New("database unavailable again")
+	check(http.StatusServiceUnavailable, `{"status":"not_ready"}`)
+}

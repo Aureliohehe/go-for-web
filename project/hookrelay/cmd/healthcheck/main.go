@@ -1,18 +1,13 @@
 package main
 
 import (
-	"context"
 	"database/sql"
-
 	"log"
 	"net"
-	"net/http"
-
 	"time"
 
 	"github.com/aurelio/hookrelay/internal/config"
-
-	"github.com/gin-gonic/gin"
+	"github.com/aurelio/hookrelay/internal/handler"
 	"github.com/go-sql-driver/mysql"
 )
 
@@ -34,25 +29,7 @@ func main() {
 		log.Fatal(err)
 	}
 	defer db.Close()
-	router := gin.Default()
-	router.GET("/healthz", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{
-			"status": "ok",
-		})
-	})
-	router.GET("/readyz", func(c *gin.Context) {
-		ctx, cancel := context.WithTimeout(c.Request.Context(), time.Second)
-		defer cancel()
-		if err := db.PingContext(ctx); err != nil {
-			c.JSON(http.StatusServiceUnavailable, gin.H{
-				"status": "not_ready",
-			})
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{
-			"status": "ready",
-		})
-	})
+	router := handler.NewRouter(db.PingContext)
 	if err := router.Run(appCfg.HTTPAddr); err != nil {
 		log.Fatal(err)
 	}
