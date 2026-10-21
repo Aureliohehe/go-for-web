@@ -1,34 +1,41 @@
-package main
+package config_test
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/aurelio/hookrelay/internal/config"
+)
 
 func TestLoadDBConfigMissingPassword(t *testing.T) {
+	t.Setenv("HTTP_ADDR", "")
 	t.Setenv("MYSQL_PASSWORD", "")
 
-	_, err := loadDBConfig()
+	_, err := config.Load()
 	if err == nil {
 		t.Fatal("密码为空时应返回错误，但得到 nil")
 	}
 }
 
 func TestLoadDBConfigSuccess(t *testing.T) {
+	t.Setenv("HTTP_ADDR", "")
 	t.Setenv("MYSQL_HOST", "127.0.0.1")
 	t.Setenv("MYSQL_PORT", "13306")
 	t.Setenv("MYSQL_USER", "test_user")
 	t.Setenv("MYSQL_PASSWORD", "test_password")
 	t.Setenv("MYSQL_DATABASE", "test_db")
 
-	cfg, err := loadDBConfig()
+	cfg, err := config.Load()
 	if err != nil {
 		t.Fatalf("配置完整时不应报错：%v", err)
 	}
 
-	want := DBConfig{
-		Host:     "127.0.0.1",
-		Port:     "13306",
-		User:     "test_user",
-		Password: "test_password",
-		Database: "test_db",
+	want := config.Config{
+		HTTPAddr:      "127.0.0.1:8080",
+		MySQLHost:     "127.0.0.1",
+		MySQLPort:     "13306",
+		MySQLUser:     "test_user",
+		MySQLPassword: "test_password",
+		MySQLDatabase: "test_db",
 	}
 	if cfg != want {
 		t.Fatal("读取到的配置与预期不一致")
@@ -36,22 +43,23 @@ func TestLoadDBConfigSuccess(t *testing.T) {
 }
 
 func TestLoadDBConfigDefaults(t *testing.T) {
-
+	t.Setenv("HTTP_ADDR", "")
 	t.Setenv("MYSQL_HOST", "")
 	t.Setenv("MYSQL_PORT", "")
 	t.Setenv("MYSQL_USER", "")
 	t.Setenv("MYSQL_PASSWORD", "test_password")
 	t.Setenv("MYSQL_DATABASE", "")
-	cfg, err := loadDBConfig()
+	cfg, err := config.Load()
 	if err != nil {
 		t.Fatalf("配置完整时不应报错：%v", err)
 	}
-	want := DBConfig{
-		Host:     "127.0.0.1",
-		Port:     "13306",
-		User:     "hookrelay",
-		Password: "test_password",
-		Database: "hookrelay",
+	want := config.Config{
+		HTTPAddr:      "127.0.0.1:8080",
+		MySQLHost:     "127.0.0.1",
+		MySQLPort:     "13306",
+		MySQLUser:     "hookrelay",
+		MySQLPassword: "test_password",
+		MySQLDatabase: "hookrelay",
 	}
 	if cfg != want {
 		t.Fatal("读取到的配置与预期不一致")
@@ -59,6 +67,7 @@ func TestLoadDBConfigDefaults(t *testing.T) {
 }
 
 func TestLoadDBConfigPort(t *testing.T) {
+	t.Setenv("HTTP_ADDR", "")
 	tests := []struct {
 		name    string
 		port    string
@@ -79,9 +88,38 @@ func TestLoadDBConfigPort(t *testing.T) {
 			t.Setenv("MYSQL_PASSWORD", "test_password")
 			t.Setenv("MYSQL_PORT", tt.port)
 
-			_, err := loadDBConfig()
+			_, err := config.Load()
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("error = %v, wantErr = %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoadHTTPAddr(t *testing.T) {
+	tests := []struct {
+		name    string
+		addr    string
+		wantErr bool
+	}{
+		{name: "custom", addr: "127.0.0.1:9090"},
+		{name: "missing port", addr: "127.0.0.1", wantErr: true},
+		{name: "invalid port", addr: "127.0.0.1:abc", wantErr: true},
+		{name: "out of range", addr: "127.0.0.1:65536", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("MYSQL_PASSWORD", "test_password")
+			t.Setenv("MYSQL_PORT", "13306")
+			t.Setenv("HTTP_ADDR", tt.addr)
+
+			cfg, err := config.Load()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("error = %v, wantErr = %v", err, tt.wantErr)
+			}
+			if err == nil && cfg.HTTPAddr != tt.addr {
+				t.Fatal("HTTP_ADDR 未正确读取")
 			}
 		})
 	}
