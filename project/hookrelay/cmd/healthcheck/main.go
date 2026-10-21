@@ -13,13 +13,33 @@ import (
 	"github.com/go-sql-driver/mysql"
 )
 
+type DBConfig struct {
+	Host     string
+	Port     string
+	User     string
+	Password string
+	Database string
+}
+
+func loadDBConfig() DBConfig {
+	return DBConfig{
+		Host:     os.Getenv("MYSQL_HOST"),
+		Port:     os.Getenv("MYSQL_PORT"),
+		User:     os.Getenv("MYSQL_USER"),
+		Password: os.Getenv("MYSQL_PASSWORD"),
+		Database: os.Getenv("MYSQL_DATABASE"),
+	}
+}
+
 func main() {
+	appCfg := loadDBConfig()
+
 	cfg := mysql.NewConfig()
-	cfg.User = os.Getenv("MYSQL_USER")
-	cfg.Passwd = os.Getenv("MYSQL_PASSWORD")
+	cfg.User = appCfg.User
+	cfg.Passwd = appCfg.Password
 	cfg.Net = "tcp"
-	cfg.Addr = net.JoinHostPort(os.Getenv("MYSQL_HOST"), os.Getenv("MYSQL_PORT"))
-	cfg.DBName = os.Getenv("MYSQL_DATABASE")
+	cfg.Addr = net.JoinHostPort(appCfg.Host, appCfg.Port)
+	cfg.DBName = appCfg.Database
 	cfg.Timeout = 3 * time.Second
 	db, err := sql.Open("mysql", cfg.FormatDSN())
 	if err != nil {
