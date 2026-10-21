@@ -6,6 +6,12 @@
 
 > 当前已完成第一天的 API 基础骨架：配置、MySQL 连接、健康检查和测试。上述业务能力尚未实现，不应作为生产服务使用。
 
+## 学习进度（下次先看这里）
+
+详见 [学习记录与下次起点](docs/learning-progress.md)。
+
+用户已亲手完成环境变量读取、MySQL 连接、HTTP 健康检查及数据库故障恢复实验。下次从 **将 `cmd/healthcheck/main.go` 的配置读取逻辑逐步提取到配置包** 开始，先解释，再由用户动手，不直接代写完整实现。
+
 ## 第一天：启动与验证
 
 按 [第一天操作指南](docs/day-01.md) 启动 MySQL、运行 API，并验证数据库故障时两个健康接口的区别。
@@ -17,7 +23,7 @@
 - `go test ./...`：运行不依赖数据库的测试，集成测试默认跳过。
 - `HOOKRELAY_INTEGRATION=1 go test -v ./internal/store`：导出数据库配置后运行真实连接测试。
 
-当前环境的 Docker Desktop WSL 集成尚未启用，Compose 启动路径待验证；独立临时 MySQL 实例上的连接与健康检查已验证。
+用户已确认 Docker 工具及引擎可用，并完成 Compose 启动 MySQL、数据库停止与恢复的手动验证。`docs/day-01.md` 保留的是初始实现时的操作指南与验证记录，最新学习状态以学习进度文档为准。
 
 ## 项目计划
 
@@ -30,6 +36,7 @@
 
 ## 下一步
 
-1. 启用 Docker Desktop WSL 集成，按第一天指南验证 Compose 启动流程。
-2. 创建 endpoints、events、deliveries 数据库迁移。
-3. 实现端点管理、事件持久化与幂等接入。
+1. 从用户的练习代码出发，理解并逐步提取配置读取逻辑。
+2. 理解 handler、store 与 main 的职责，按小步骤完成拆分。
+3. 再设计 endpoints、events、deliveries 数据模型与迁移。
+4. 实现端点管理、事件持久化与幂等接入。

@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -21,18 +23,37 @@ type DBConfig struct {
 	Database string
 }
 
-func loadDBConfig() DBConfig {
-	return DBConfig{
-		Host:     os.Getenv("MYSQL_HOST"),
-		Port:     os.Getenv("MYSQL_PORT"),
-		User:     os.Getenv("MYSQL_USER"),
-		Password: os.Getenv("MYSQL_PASSWORD"),
-		Database: os.Getenv("MYSQL_DATABASE"),
+func loadDBConfig() (DBConfig, error) {
+	cfg := DBConfig{
+		Host:     envOrDefault("MYSQL_HOST", "127.0.0.1"),
+		Port:     envOrDefault("MYSQL_PORT", "13306"),
+		User:     envOrDefault("MYSQL_USER", "hookrelay"),
+		Password: envOrDefault("MYSQL_PASSWORD", ""),
+		Database: envOrDefault("MYSQL_DATABASE", "hookrelay"),
 	}
+	if cfg.Password == "" {
+		return DBConfig{}, errors.New("MYSQL_PASSWORD is required")
+	}
+	port, err := strconv.Atoi(cfg.Port)
+	if err != nil || port < 1 || port > 65535 {
+		return DBConfig{}, errors.New(
+			"MYSQL_PORT must be an integer between 1 and 65535",
+		)
+	}
+	return cfg, nil
 }
-
+func envOrDefault(key, fallback string) string {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	return value
+}
 func main() {
-	appCfg := loadDBConfig()
+	appCfg, err := loadDBConfig()
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	cfg := mysql.NewConfig()
 	cfg.User = appCfg.User
