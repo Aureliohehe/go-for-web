@@ -1,36 +1,41 @@
 package main
 
 import (
-	"database/sql"
+	"context"
+	"fmt"
 	"log"
-	"net"
 	"time"
 
 	"github.com/aurelio/hookrelay/internal/config"
 	"github.com/aurelio/hookrelay/internal/handler"
-	"github.com/go-sql-driver/mysql"
+	"github.com/aurelio/hookrelay/internal/store"
 )
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
 	appCfg, err := config.Load()
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("load config: %w", err)
 	}
 
-	cfg := mysql.NewConfig()
-	cfg.User = appCfg.MySQLUser
-	cfg.Passwd = appCfg.MySQLPassword
-	cfg.Net = "tcp"
-	cfg.Addr = net.JoinHostPort(appCfg.MySQLHost, appCfg.MySQLPort)
-	cfg.DBName = appCfg.MySQLDatabase
-	cfg.Timeout = 3 * time.Second
-	db, err := sql.Open("mysql", cfg.FormatDSN())
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_, pool, err := store.OpenMySQL(ctx, appCfg)
+	cancel()
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("open database: %w", err)
 	}
-	defer db.Close()
-	router := handler.NewRouter(db.PingContext)
+	defer pool.Close()
+
+	log.Print("mysql connected")
+
+	router := handler.NewRouter(pool.PingContext)
 	if err := router.Run(appCfg.HTTPAddr); err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("serve http: %w", err)
 	}
+	return nil
 }
