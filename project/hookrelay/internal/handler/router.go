@@ -27,5 +27,20 @@ func NewRouter(pingDatabase func(context.Context) error) *gin.Engine {
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "ready"})
 	})
+
+	return router
+}
+
+func NewAPIRouter(
+	pingDatabase func(context.Context) error,
+	apiKey string,
+	findEndpoint EndpointFinder,
+) *gin.Engine {
+	router := NewRouter(pingDatabase)
+
+	v1 := router.Group("/v1")
+	v1.Use(RequireAPIKey(apiKey))
+	v1.GET("/endpoints/:id", GetEndpoint(findEndpoint))
+
 	return router
 }

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -71,6 +72,16 @@ func TestEndpointRoundTripIntegration(t *testing.T) {
 			}
 			if got.CreatedAt.IsZero() {
 				t.Fatal("创建时间不应为空")
+			}
+
+			if err := tx.WithContext(ctx).
+				Delete(&Endpoint{}, endpoint.ID).Error; err != nil {
+				t.Fatal(err)
+			}
+
+			_, err = FindEndpoint(ctx, tx, endpoint.ID)
+			if !errors.Is(err, ErrEndpointNotFound) {
+				t.Fatalf("error = %v, want ErrEndpointNotFound", err)
 			}
 		})
 	}

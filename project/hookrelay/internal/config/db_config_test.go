@@ -23,6 +23,7 @@ func TestLoadDBConfigSuccess(t *testing.T) {
 	t.Setenv("MYSQL_USER", "test_user")
 	t.Setenv("MYSQL_PASSWORD", "test_password")
 	t.Setenv("MYSQL_DATABASE", "test_db")
+	t.Setenv("API_KEY", "test-key")
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -36,6 +37,7 @@ func TestLoadDBConfigSuccess(t *testing.T) {
 		MySQLUser:     "test_user",
 		MySQLPassword: "test_password",
 		MySQLDatabase: "test_db",
+		APIKey:        "test-key",
 	}
 	if cfg != want {
 		t.Fatal("读取到的配置与预期不一致")
@@ -49,6 +51,7 @@ func TestLoadDBConfigDefaults(t *testing.T) {
 	t.Setenv("MYSQL_USER", "")
 	t.Setenv("MYSQL_PASSWORD", "test_password")
 	t.Setenv("MYSQL_DATABASE", "")
+	t.Setenv("API_KEY", "")
 	cfg, err := config.Load()
 	if err != nil {
 		t.Fatalf("配置完整时不应报错：%v", err)

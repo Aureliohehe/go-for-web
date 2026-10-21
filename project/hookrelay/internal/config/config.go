@@ -16,6 +16,7 @@ type Config struct {
 	MySQLDatabase string
 	MySQLUser     string
 	MySQLPassword string
+	APIKey        string
 }
 
 func Load() (Config, error) {
@@ -36,6 +37,7 @@ func load(getenv func(string) string) (Config, error) {
 		MySQLDatabase: value("MYSQL_DATABASE", "hookrelay"),
 		MySQLUser:     value("MYSQL_USER", "hookrelay"),
 		MySQLPassword: getenv("MYSQL_PASSWORD"),
+		APIKey:        getenv("API_KEY"),
 	}
 	if cfg.MySQLPassword == "" {
 		return Config{}, fmt.Errorf("MYSQL_PASSWORD is required; export the variables in .env first")

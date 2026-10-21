@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -16,6 +17,8 @@ type Endpoint struct {
 	CreatedAt     time.Time
 }
 
+var ErrEndpointNotFound = errors.New("endpoint not found")
+
 func CreateEndpoint(ctx context.Context, db *gorm.DB, endpoint *Endpoint) error {
 	if err := db.WithContext(ctx).Create(endpoint).Error; err != nil {
 		return fmt.Errorf("create endpoint: %w", err)
@@ -26,10 +29,15 @@ func CreateEndpoint(ctx context.Context, db *gorm.DB, endpoint *Endpoint) error 
 func FindEndpoint(ctx context.Context, db *gorm.DB, id uint64) (Endpoint,
 	error) {
 	var endpoint Endpoint
-	if err := db.WithContext(ctx).
+	err := db.WithContext(ctx).
 		Where("id = ?", id).
-		First(&endpoint).Error; err != nil {
+		First(&endpoint).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return Endpoint{}, ErrEndpointNotFound
+	}
+	if err != nil {
 		return Endpoint{}, fmt.Errorf("find endpoint: %w", err)
 	}
+
 	return endpoint, nil
 }

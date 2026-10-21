@@ -32,8 +32,11 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if cfg.APIKey == "" {
+		return fmt.Errorf("API_KEY is required")
+	}
 	connectCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	_, pool, err := store.OpenMySQL(connectCtx, cfg)
+	db, pool, err := store.OpenMySQL(connectCtx, cfg)
 	cancel()
 	if err != nil {
 		return err
@@ -42,7 +45,13 @@ func run(ctx context.Context) error {
 	slog.Info("mysql connected")
 
 	gin.SetMode(gin.ReleaseMode)
-	router := handler.NewRouter(pool.PingContext)
+	router := handler.NewAPIRouter(
+		pool.PingContext,
+		cfg.APIKey,
+		func(ctx context.Context, id uint64) (store.Endpoint, error) {
+			return store.FindEndpoint(ctx, db, id)
+		},
+	)
 	if err := router.SetTrustedProxies(nil); err != nil {
 		return fmt.Errorf("configure trusted proxies: %w", err)
 	}
