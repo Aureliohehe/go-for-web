@@ -35,6 +35,9 @@ func run(ctx context.Context) error {
 	if cfg.APIKey == "" {
 		return fmt.Errorf("API_KEY is required")
 	}
+	if cfg.AllowedEndpointURL == "" {
+		return fmt.Errorf("ALLOWED_ENDPOINT_URL is required")
+	}
 	connectCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	db, pool, err := store.OpenMySQL(connectCtx, cfg)
 	cancel()
@@ -48,8 +51,12 @@ func run(ctx context.Context) error {
 	router := handler.NewAPIRouter(
 		pool.PingContext,
 		cfg.APIKey,
+		cfg.AllowedEndpointURL,
 		func(ctx context.Context, id uint64) (store.Endpoint, error) {
 			return store.FindEndpoint(ctx, db, id)
+		},
+		func(ctx context.Context, endpoint *store.Endpoint) error {
+			return store.CreateEndpoint(ctx, db, endpoint)
 		},
 	)
 	if err := router.SetTrustedProxies(nil); err != nil {

@@ -24,6 +24,7 @@ func TestLoadDBConfigSuccess(t *testing.T) {
 	t.Setenv("MYSQL_PASSWORD", "test_password")
 	t.Setenv("MYSQL_DATABASE", "test_db")
 	t.Setenv("API_KEY", "test-key")
+	t.Setenv("ALLOWED_ENDPOINT_URL", "")
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -52,6 +53,7 @@ func TestLoadDBConfigDefaults(t *testing.T) {
 	t.Setenv("MYSQL_PASSWORD", "test_password")
 	t.Setenv("MYSQL_DATABASE", "")
 	t.Setenv("API_KEY", "")
+	t.Setenv("ALLOWED_ENDPOINT_URL", "")
 	cfg, err := config.Load()
 	if err != nil {
 		t.Fatalf("配置完整时不应报错：%v", err)

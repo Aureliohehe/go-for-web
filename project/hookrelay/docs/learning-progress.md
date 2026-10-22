@@ -1,14 +1,12 @@
 # 学习进度与下次起点
 
-> 本轮已完成：配置/handler/store 拆分、优雅退出、endpoints 表及数据库读写、API Key 中间件、接收端查询接口和测试。
-> **下次从 `POST /v1/endpoints` 创建接收端接口开始，不要重新讲配置拆分。**
+> 已完成：配置/handler/store 拆分、优雅退出、endpoints 表及数据库读写、API Key 中间件、接收端创建与查询接口及单元测试。
+> **下次先讲解 POST 请求链路并验证真实 HTTP + MySQL 创建→查询闭环。**
 
 ## 辅导方式与协作约定
 
-- 用户希望带着学习，不默认由助手代写整个项目。
-- 最新节奏偏好：**一次布置一组相关任务，可以加快进度**，不再每次只讲一小步。
-- 先解释目的和关键设计，再让用户动手；用户反馈后读取实际文件检查，不能只根据“完成”判断代码正确。
-- 用户明确说“帮我完成/帮我写测试”时，可以直接修改对应代码并运行验证；不把单次授权扩展为包办后续所有业务。
+- 最新偏好：**助手写代码，用户理解逻辑；不懂的地方由助手讲解**。讲解按请求链路展开，不要默认把实现任务布置给用户。
+- 用户明确要求的代写范围为当前创建接收端功能；后续任务继续确认需求与节奏。
 - 可以直接维护进度文档。未明确要求时，不自动提交、推送或部署，不自动停止用户的服务。
 - 不读取、记录或输出真实密码、API Key、DSN。`.env` 保持本地私有。
 - 最初的 `cmd/api`、`internal/config`、`internal/handler`、`internal/store` 来自助手参考骨架。本轮用户已在解释后实际接入和扩展，不能据此声称全部代码是用户独立设计的。
@@ -133,20 +131,16 @@ git diff --check
 
 `docs/day-01.md` 和 `PLAN.md` 中部分“当前起点”属于初始阶段历史描述；最新状态以本文为准。不要按照旧文档重新排查已解决的 Docker 阻塞或重复拆分配置。
 
-## 下次从这里开始
+## 创建接口实现与下次起点
 
-**主题：实现 `POST /v1/endpoints`，不是重新做配置拆分或 GET 接口。**
+用户明确改为“助手写代码、用户理解逻辑”。本次助手实现 `POST /v1/endpoints`：
 
-先读取当前代码与 Git 状态，再按一组相关任务推进：
-
-1. 简短复盘现有查询链路和助手补写的测试，确认用户需要解释哪些内容。
-2. 先明确创建接口契约：输入只接受受控 URL；ID、enabled 初始状态和签名密钥由服务端管理；创建成功返回 201。
-3. 实现请求体大小限制、JSON 解析/校验，以及明确配置的受控 URL allowlist。拒绝任意公网转发；初版可按完整测试 URL 精确匹配，不引入复杂 DNS/SSRF 体系。
-4. 用 `crypto/rand` 生成 32 字节、hex 编码为 64 字符签名密钥，不使用固定值或 math/rand。
-5. **先约定密钥交付方式：** 可考虑仅创建成功时一次性返回给调用方用于配置接收端；查询接口始终不返回，日志也不记录。不要在未讨论的情况下让接收端永远拿不到签名密钥。
-6. 注入创建函数，调用现有 `store.CreateEndpoint`，挂在已有受鉴权的 `/v1` 组，接入 `cmd/api`；不要在练习入口继续扩展业务。
-7. 增加测试：未鉴权不写库、错误/空/多段 JSON、超大请求、非 allowlist URL、密钥格式、创建成功、数据库失败脱敏。按实际实现约定是否拒绝未知字段，不要让调用方覆盖服务端字段。
-8. 最后运行真实 API：创建 → 查询 → 验证查询不返回密钥，补上真实 HTTP + 数据库闭环验证记录。
+- `ALLOWED_ENDPOINT_URL` 为单个完整 URL；配置加载时校验 http(s) URL 的格式，`cmd/api` 在连接数据库前要求非空。需自行在本地配置环境变量，不能假定 `.env` 已更新。
+- 路由在受 `X-API-Key` 保护的 `/v1` 组。只接受 `application/json`、最大 4096 字节；拒绝未知字段、多段 JSON、超长请求与非精确匹配 URL。允许 URL 是操作员配置的值，不是开放公网 URL 的许可；仍非可公开部署的 SSRF 防护方案。
+- `crypto/rand` 生成 32 字节签名密钥，hex 编码为 64 字符；服务端控制 enabled=true；存库成功后返回 201、字符串 ID、URL、enabled、created_at 和一次性交付的 `signing_secret`。GET 不返回密钥；数据库错误不返回给客户端。
+- 注入 `EndpointCreator` 调用 store 层；新增 handler 测试，更新现有查询测试、配置测试和启动配置测试。
+- 新增 `cmd/api/endpoint_integration_test.go`：使用真实本地 HTTP 与 MySQL，在事务中验证创建→查询、密钥只在创建响应出现，并在测试结束回滚。默认跳过，需 `HOOKRELAY_INTEGRATION=1`、环境数据库配置和已应用的 endpoints 迁移。普通测试已运行，**真实 HTTP + MySQL 测试尚未执行**。
+- 已运行 `go test ./...`、`go vet ./...`、`go test -race ./internal/handler`、`git diff --check`；下一步结合代码解释集成测试并让用户自行在受控环境运行，不能宣称真实数据库已验证。
 
 之后再推进 PATCH 启用/禁用、events/deliveries 表和事件事务幂等。当前尚无事件接口、Redis/Asynq、Outbox、投递、重试或签名发送功能，不能宣称可靠投递已实现。
 
@@ -167,18 +161,20 @@ set +a
 if [ -z "${API_KEY:-}" ]; then
   export API_KEY="$(openssl rand -hex 32)"
 fi
+export ALLOWED_ENDPOINT_URL="${ALLOWED_ENDPOINT_URL:-http://127.0.0.1:9090/webhook}"
 
 go run ./cmd/api
 ```
 
 - 临时生成的密钥不会自动写入 `.env`；另一个终端也不会自动继承它。不在对话中粘贴密钥。
+- `cmd/api` 还要求 `ALLOWED_ENDPOINT_URL`（例如本地开发用 `http://127.0.0.1:9090/webhook`）；不要把真实密钥贴到对话中。
 - `cmd/api` 和 `cmd/healthcheck` 默认都监听 8080，不要同时启动。
 - 先用 `/healthz`、`/readyz` 检查服务；若 HTTP_ADDR 已修改，使用实际地址。
 - 不要重复执行已应用的 CREATE TABLE。若数据库卷改变或表缺失，先确认数据库和迁移状态，不通过删表或 AutoMigrate 绕过问题。
 - 若执行集成测试，需数据库运行、迁移已应用，且当前终端已导出数据库配置：
 
 ```bash
-HOOKRELAY_INTEGRATION=1 go test -count=1 -v ./internal/store
+HOOKRELAY_INTEGRATION=1 go test -count=1 -v ./internal/store ./cmd/api
 ```
 
 ## 收尾与保存边界

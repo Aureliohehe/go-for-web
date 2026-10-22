@@ -3,20 +3,23 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 )
 
-// Config contains only the settings needed by the day-one API.
+// Config contains settings for the API and the database.
 // Never log this struct: it contains the database password.
 type Config struct {
-	HTTPAddr      string
-	MySQLHost     string
-	MySQLPort     string
-	MySQLDatabase string
-	MySQLUser     string
-	MySQLPassword string
-	APIKey        string
+	HTTPAddr           string
+	MySQLHost          string
+	MySQLPort          string
+	MySQLDatabase      string
+	MySQLUser          string
+	MySQLPassword      string
+	APIKey             string
+	AllowedEndpointURL string
 }
 
 func Load() (Config, error) {
@@ -31,13 +34,14 @@ func load(getenv func(string) string) (Config, error) {
 		return fallback
 	}
 	cfg := Config{
-		HTTPAddr:      value("HTTP_ADDR", "127.0.0.1:8080"),
-		MySQLHost:     value("MYSQL_HOST", "127.0.0.1"),
-		MySQLPort:     value("MYSQL_PORT", "13306"),
-		MySQLDatabase: value("MYSQL_DATABASE", "hookrelay"),
-		MySQLUser:     value("MYSQL_USER", "hookrelay"),
-		MySQLPassword: getenv("MYSQL_PASSWORD"),
-		APIKey:        getenv("API_KEY"),
+		HTTPAddr:           value("HTTP_ADDR", "127.0.0.1:8080"),
+		MySQLHost:          value("MYSQL_HOST", "127.0.0.1"),
+		MySQLPort:          value("MYSQL_PORT", "13306"),
+		MySQLDatabase:      value("MYSQL_DATABASE", "hookrelay"),
+		MySQLUser:          value("MYSQL_USER", "hookrelay"),
+		MySQLPassword:      getenv("MYSQL_PASSWORD"),
+		APIKey:             getenv("API_KEY"),
+		AllowedEndpointURL: getenv("ALLOWED_ENDPOINT_URL"),
 	}
 	if cfg.MySQLPassword == "" {
 		return Config{}, fmt.Errorf("MYSQL_PASSWORD is required; export the variables in .env first")
@@ -49,7 +53,19 @@ func load(getenv func(string) string) (Config, error) {
 	if err != nil || !validPort(port) {
 		return Config{}, fmt.Errorf("HTTP_ADDR must have the form host:port with a port between 1 and 65535")
 	}
+	if cfg.AllowedEndpointURL != "" && !validEndpointURL(cfg.AllowedEndpointURL) {
+		return Config{}, fmt.Errorf("ALLOWED_ENDPOINT_URL must be a valid absolute http(s) URL without credentials or fragment")
+	}
 	return cfg, nil
+}
+
+func validEndpointURL(raw string) bool {
+	if len(raw) > 2048 || strings.TrimSpace(raw) != raw || strings.Contains(raw, "#") {
+		return false
+	}
+	u, err := url.Parse(raw)
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") &&
+		u.Hostname() != "" && u.User == nil && u.Fragment == "" && u.Opaque == ""
 }
 
 func validPort(raw string) bool {

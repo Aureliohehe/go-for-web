@@ -105,6 +105,7 @@ func TestGetEndpoint(t *testing.T) {
 					return nil
 				},
 				apiKey,
+				"http://127.0.0.1:9090/webhook",
 				func(ctx context.Context, id uint64) (store.Endpoint, error) {
 					lookupCalls++
 					if id != tt.wantID {
@@ -117,6 +118,10 @@ func TestGetEndpoint(t *testing.T) {
 						ID: id, URL: "http://127.0.0.1:9090/webhook",
 						SigningSecret: signingSecret, Enabled: !tt.disabled, CreatedAt: createdAt,
 					}, tt.dbErr
+				},
+				func(context.Context, *store.Endpoint) error {
+					t.Error("GET must not create endpoints")
+					return nil
 				},
 			)
 
@@ -199,9 +204,14 @@ func TestAPIRouterHealthChecksWithoutAPIKey(t *testing.T) {
 					return tt.pingErr
 				},
 				"test-api-key",
+				"http://127.0.0.1:9090/webhook",
 				func(context.Context, uint64) (store.Endpoint, error) {
 					t.Error("health routes must not query endpoints")
 					return store.Endpoint{}, errors.New("unexpected lookup")
+				},
+				func(context.Context, *store.Endpoint) error {
+					t.Error("health routes must not create endpoints")
+					return nil
 				},
 			)
 

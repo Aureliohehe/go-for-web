@@ -34,13 +34,16 @@ func NewRouter(pingDatabase func(context.Context) error) *gin.Engine {
 func NewAPIRouter(
 	pingDatabase func(context.Context) error,
 	apiKey string,
+	allowedEndpointURL string,
 	findEndpoint EndpointFinder,
+	createEndpoint EndpointCreator,
 ) *gin.Engine {
 	router := NewRouter(pingDatabase)
 
 	v1 := router.Group("/v1")
 	v1.Use(RequireAPIKey(apiKey))
 	v1.GET("/endpoints/:id", GetEndpoint(findEndpoint))
+	v1.POST("/endpoints", PostEndpoint(allowedEndpointURL, createEndpoint))
 
 	return router
 }
