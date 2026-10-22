@@ -1,7 +1,7 @@
 # 学习进度与下次起点
 
-> 已完成接收端创建→查询的真实 HTTP + MySQL 验证；新增启用/禁用接口、测试待真实数据库复测。
-> **下次先讲解 PATCH 请求链路并验证真实 HTTP + MySQL 创建→查询→禁用→启用闭环。**
+> 已完成接收端创建→查询及 PATCH 启用/禁用的真实 HTTP + MySQL 验证（用户反馈通过）。
+> 新增 events/deliveries 增量迁移文件和事件请求摘要函数；迁移未由助手执行，事件事务与接口仍待实现。
 
 ## 辅导方式与协作约定
 
@@ -145,10 +145,15 @@ git diff --check
 
 - `PATCH /v1/endpoints/:id`：受 API Key 鉴权，请求只接收 `{"enabled":true/false}`，复用 POST 的 JSON 格式/大小限制；缺省和 null 值被拒绝，成功返回公开字段且不泄露签名密钥。非法 ID 400、不存在 404、其他数据库错误 500。
 - `store.SetEndpointEnabled` 显式 `Update("enabled", enabled)`（false 也会写入），随后查询记录；重复设置相同值也算成功，不依赖 MySQL 对未改变记录的 RowsAffected 行为。
-- 已增加 handler 测试、store 集成测试，并扩展 HTTP + MySQL 集成测试来覆盖禁用、重复禁用、启用及密钥不变；测试在事务内回滚，但会消耗自增 ID。普通测试与 vet / race 检查以本轮实际运行结果为准。**PATCH 的真实数据库集成测试仍需用户重跑**。
+- 已增加 handler 测试、store 集成测试，并扩展 HTTP + MySQL 集成测试来覆盖禁用、重复禁用、启用及密钥不变；测试在事务内回滚，但会消耗自增 ID。**用户反馈 PATCH 的真实数据库集成测试已通过**；不是助手自行运行。
 - 这只是配置状态变更：事件接收、投递前禁用检查尚未实现，不能声称禁用能阻止实际投递。
 
-之后再推进 events/deliveries 表和事件事务幂等。当前尚无事件接口、Redis/Asynq、Outbox、投递、重试或签名发送功能，不能宣称可靠投递已实现。
+## 事件接入：当前起点
+
+- 新增 `migrations/000002_create_events_deliveries.up.sql`，基于已存在的 endpoints 表创建 events 与 deliveries；`idempotency_key` 为字节精确的 VARBINARY(128) 全局唯一，`request_hash` 为 32 字节摘要，原始 payload 以 MEDIUMBLOB 保存，event_id 在 deliveries 中唯一。没有执行迁移、没有 AutoMigrate 或重置表；MySQL DDL 不是多表原子事务，手动应用前要确认数据库现状，失败时先检查是否部分创建而非盲目重跑。
+- 新增 `internal/store/event_hash.go`：SHA-256 摘要输入为端点 ID、带长度前缀的事件类型、带长度前缀的原始 payload 字节；幂等键不参与摘要，只负责查重定位。同一键同一内容应返回原 ID，同键不同内容将来返回 409；不同 JSON 空白会视为不同内容。单元测试覆盖输入变化和字段边界。
+- `go test ./...`、`go vet ./...`、`git diff --check` 通过；未执行新迁移或 MySQL 相关测试。**下一步由用户检查并应用迁移，再实现事件/投递事务与并发幂等测试，最后接 HTTP 事件接口。**
+- 当前尚无事件接口、Redis/Asynq、Outbox、投递、重试或签名发送功能，不能宣称可靠投递已实现。
 
 ## 下次恢复环境
 
