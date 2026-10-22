@@ -37,6 +37,7 @@ func NewAPIRouter(
 	allowedEndpointURL string,
 	findEndpoint EndpointFinder,
 	createEndpoint EndpointCreator,
+	updateEndpointEnabled EndpointEnabledUpdater,
 ) *gin.Engine {
 	router := NewRouter(pingDatabase)
 
@@ -44,6 +45,7 @@ func NewAPIRouter(
 	v1.Use(RequireAPIKey(apiKey))
 	v1.GET("/endpoints/:id", GetEndpoint(findEndpoint))
 	v1.POST("/endpoints", PostEndpoint(allowedEndpointURL, createEndpoint))
+	v1.PATCH("/endpoints/:id", PatchEndpointEnabled(updateEndpointEnabled))
 
 	return router
 }

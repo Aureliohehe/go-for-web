@@ -14,11 +14,8 @@ type EndpointFinder func(context.Context, uint64) (store.Endpoint, error)
 
 func GetEndpoint(find EndpointFinder) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		id, err := strconv.ParseUint(c.Param("id"), 10, 64)
-		if err != nil || id == 0 {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error": "invalid_endpoint_id",
-			})
+		id, ok := parseEndpointID(c)
+		if !ok {
 			return
 		}
 
@@ -36,11 +33,25 @@ func GetEndpoint(find EndpointFinder) gin.HandlerFunc {
 			return
 		}
 
-		c.JSON(http.StatusOK, gin.H{
-			"id":         strconv.FormatUint(endpoint.ID, 10),
-			"url":        endpoint.URL,
-			"enabled":    endpoint.Enabled,
-			"created_at": endpoint.CreatedAt,
-		})
+		c.JSON(http.StatusOK, endpointResponse(endpoint))
+	}
+}
+
+func parseEndpointID(c *gin.Context) (uint64, bool) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil || id == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_endpoint_id"})
+		return 0, false
+	}
+	return id, true
+}
+
+// Never serialize store.Endpoint directly: it contains the signing secret.
+func endpointResponse(endpoint store.Endpoint) gin.H {
+	return gin.H{
+		"id":         strconv.FormatUint(endpoint.ID, 10),
+		"url":        endpoint.URL,
+		"enabled":    endpoint.Enabled,
+		"created_at": endpoint.CreatedAt,
 	}
 }

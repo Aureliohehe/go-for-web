@@ -4,10 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
-	"errors"
-	"io"
-	"mime"
 	"net/http"
 	"strconv"
 
@@ -15,36 +11,16 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const maxEndpointBodyBytes = 4096
-
 type EndpointCreator func(context.Context, *store.Endpoint) error
 
 // PostEndpoint accepts only an exact operator-configured URL. The secret is
 // delivered once, in the successful creation response; GET never returns it.
 func PostEndpoint(allowedURL string, create EndpointCreator) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		mediaType, _, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
-		if err != nil || mediaType != "application/json" {
-			c.JSON(http.StatusUnsupportedMediaType, gin.H{"error": "unsupported_media_type"})
-			return
-		}
-
-		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxEndpointBodyBytes)
-		decoder := json.NewDecoder(c.Request.Body)
-		decoder.DisallowUnknownFields()
 		var input struct {
 			URL string `json:"url"`
 		}
-		if err := decoder.Decode(&input); err != nil {
-			writeEndpointDecodeError(c, err)
-			return
-		}
-		// A second decode rejects trailing JSON objects, arrays, or oversized padding.
-		if err := decoder.Decode(new(any)); err != io.EOF {
-			if err == nil {
-				err = errors.New("trailing JSON value")
-			}
-			writeEndpointDecodeError(c, err)
+		if !decodeEndpointJSON(c, &input) {
 			return
 		}
 		if allowedURL == "" || input.URL != allowedURL {
@@ -72,13 +48,4 @@ func PostEndpoint(allowedURL string, create EndpointCreator) gin.HandlerFunc {
 			"signing_secret": endpoint.SigningSecret,
 		})
 	}
-}
-
-func writeEndpointDecodeError(c *gin.Context, err error) {
-	var tooLarge *http.MaxBytesError
-	if errors.As(err, &tooLarge) {
-		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request_too_large"})
-		return
-	}
-	c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request"})
 }

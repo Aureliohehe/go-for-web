@@ -123,6 +123,7 @@ func TestGetEndpoint(t *testing.T) {
 					t.Error("GET must not create endpoints")
 					return nil
 				},
+				nil, // GET must not update endpoints.
 			)
 
 			response := httptest.NewRecorder()
@@ -213,6 +214,7 @@ func TestAPIRouterHealthChecksWithoutAPIKey(t *testing.T) {
 					t.Error("health routes must not create endpoints")
 					return nil
 				},
+				nil, // Health routes must not update endpoints.
 			)
 
 			response := httptest.NewRecorder()

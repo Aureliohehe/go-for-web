@@ -54,6 +54,9 @@ func TestEndpointHTTPMySQLRoundTrip(t *testing.T) {
 		func(ctx context.Context, endpoint *store.Endpoint) error {
 			return store.CreateEndpoint(ctx, tx, endpoint)
 		},
+		func(ctx context.Context, id uint64, enabled bool) (store.Endpoint, error) {
+			return store.SetEndpointEnabled(ctx, tx, id, enabled)
+		},
 	)
 	server := httptest.NewServer(router)
 	defer server.Close()
@@ -114,11 +117,85 @@ func TestEndpointHTTPMySQLRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(getBody, &got); err != nil {
 		t.Fatal("GET response is not valid JSON")
 	}
-	if len(got) != 4 || got["id"] != created.ID || got["url"] != allowedURL ||
-		got["enabled"] != true || got["created_at"] != created.CreatedAt {
-		t.Fatal("GET response does not match the created endpoint")
+	if len(got) != 4 {
+		t.Fatal("GET response has unexpected fields")
+	}
+	if got["id"] != created.ID {
+		t.Fatal("GET id does not match POST id")
+	}
+	if got["url"] != allowedURL {
+		t.Fatal("GET url does not match POST url")
+	}
+	if got["enabled"] != true {
+		t.Fatal("GET enabled does not match POST enabled")
+	}
+	if got["created_at"] != created.CreatedAt {
+		t.Fatalf("created_at mismatch: POST=%q GET=%q", created.CreatedAt, got["created_at"])
 	}
 	if _, exists := got["signing_secret"]; exists || strings.Contains(string(getBody), created.SigningSecret) {
 		t.Fatal("GET response exposed the signing secret")
+	}
+
+	// Disable, repeat the same update, then enable again. Both PATCH and GET
+	// must reflect the new flag without returning the saved signing secret.
+	for _, enabled := range []bool{false, false, true} {
+		body := `{"enabled":false}`
+		if enabled {
+			body = `{"enabled":true}`
+		}
+		request, err := http.NewRequest(http.MethodPatch, server.URL+"/v1/endpoints/"+created.ID,
+			strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("X-API-Key", key)
+		request.Header.Set("Content-Type", "application/json")
+		response, err := server.Client().Do(request)
+		if err != nil {
+			t.Fatalf("PATCH endpoint: %v", err)
+		}
+		patchBody, err := io.ReadAll(response.Body)
+		response.Body.Close()
+		if err != nil || response.StatusCode != http.StatusOK {
+			t.Fatalf("PATCH failed: status=%d, read error=%v", response.StatusCode, err)
+		}
+		var patched map[string]any
+		if err := json.Unmarshal(patchBody, &patched); err != nil {
+			t.Fatal("PATCH response is not valid JSON")
+		}
+		if len(patched) != 4 || patched["id"] != created.ID || patched["url"] != allowedURL ||
+			patched["enabled"] != enabled || patched["created_at"] != created.CreatedAt {
+			t.Fatal("PATCH response does not match the updated endpoint")
+		}
+		if strings.Contains(string(patchBody), created.SigningSecret) {
+			t.Fatal("PATCH response exposed the signing secret")
+		}
+
+		request, err = http.NewRequest(http.MethodGet, server.URL+"/v1/endpoints/"+created.ID, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("X-API-Key", key)
+		response, err = server.Client().Do(request)
+		if err != nil {
+			t.Fatalf("GET after PATCH: %v", err)
+		}
+		getBody, err := io.ReadAll(response.Body)
+		response.Body.Close()
+		if err != nil || response.StatusCode != http.StatusOK {
+			t.Fatalf("GET after PATCH failed: status=%d, read error=%v", response.StatusCode, err)
+		}
+		if err := json.Unmarshal(getBody, &got); err != nil {
+			t.Fatal("GET after PATCH response is not valid JSON")
+		}
+		if len(got) != 4 || got["enabled"] != enabled ||
+			got["id"] != created.ID || got["url"] != allowedURL ||
+			got["created_at"] != created.CreatedAt || strings.Contains(string(getBody), created.SigningSecret) {
+			t.Fatal("GET after PATCH does not match the updated endpoint or exposed the secret")
+		}
+	}
+	persisted, err := store.FindEndpoint(context.Background(), tx, id)
+	if err != nil || persisted.SigningSecret != created.SigningSecret {
+		t.Fatal("PATCH changed or lost the stored signing secret")
 	}
 }

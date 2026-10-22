@@ -58,6 +58,9 @@ func run(ctx context.Context) error {
 		func(ctx context.Context, endpoint *store.Endpoint) error {
 			return store.CreateEndpoint(ctx, db, endpoint)
 		},
+		func(ctx context.Context, id uint64, enabled bool) (store.Endpoint, error) {
+			return store.SetEndpointEnabled(ctx, db, id, enabled)
+		},
 	)
 	if err := router.SetTrustedProxies(nil); err != nil {
 		return fmt.Errorf("configure trusted proxies: %w", err)

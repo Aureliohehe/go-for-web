@@ -1,12 +1,12 @@
 # 学习进度与下次起点
 
-> 已完成：配置/handler/store 拆分、优雅退出、endpoints 表及数据库读写、API Key 中间件、接收端创建与查询接口及单元测试。
-> **下次先讲解 POST 请求链路并验证真实 HTTP + MySQL 创建→查询闭环。**
+> 已完成接收端创建→查询的真实 HTTP + MySQL 验证；新增启用/禁用接口、测试待真实数据库复测。
+> **下次先讲解 PATCH 请求链路并验证真实 HTTP + MySQL 创建→查询→禁用→启用闭环。**
 
 ## 辅导方式与协作约定
 
 - 最新偏好：**助手写代码，用户理解逻辑；不懂的地方由助手讲解**。讲解按请求链路展开，不要默认把实现任务布置给用户。
-- 用户明确要求的代写范围为当前创建接收端功能；后续任务继续确认需求与节奏。
+- 用户要求助手贴出关键代码、按执行顺序讲解；在继续开发时沿用此讲解方式，不默认让用户写代码。
 - 可以直接维护进度文档。未明确要求时，不自动提交、推送或部署，不自动停止用户的服务。
 - 不读取、记录或输出真实密码、API Key、DSN。`.env` 保持本地私有。
 - 最初的 `cmd/api`、`internal/config`、`internal/handler`、`internal/store` 来自助手参考骨架。本轮用户已在解释后实际接入和扩展，不能据此声称全部代码是用户独立设计的。
@@ -139,10 +139,16 @@ git diff --check
 - 路由在受 `X-API-Key` 保护的 `/v1` 组。只接受 `application/json`、最大 4096 字节；拒绝未知字段、多段 JSON、超长请求与非精确匹配 URL。允许 URL 是操作员配置的值，不是开放公网 URL 的许可；仍非可公开部署的 SSRF 防护方案。
 - `crypto/rand` 生成 32 字节签名密钥，hex 编码为 64 字符；服务端控制 enabled=true；存库成功后返回 201、字符串 ID、URL、enabled、created_at 和一次性交付的 `signing_secret`。GET 不返回密钥；数据库错误不返回给客户端。
 - 注入 `EndpointCreator` 调用 store 层；新增 handler 测试，更新现有查询测试、配置测试和启动配置测试。
-- 新增 `cmd/api/endpoint_integration_test.go`：使用真实本地 HTTP 与 MySQL，在事务中验证创建→查询、密钥只在创建响应出现，并在测试结束回滚。默认跳过，需 `HOOKRELAY_INTEGRATION=1`、环境数据库配置和已应用的 endpoints 迁移。普通测试已运行，**真实 HTTP + MySQL 测试尚未执行**。
-- 已运行 `go test ./...`、`go vet ./...`、`go test -race ./internal/handler`、`git diff --check`；下一步结合代码解释集成测试并让用户自行在受控环境运行，不能宣称真实数据库已验证。
+- `cmd/api/endpoint_integration_test.go` 使用真实本地 HTTP 与 MySQL，在事务中验证创建→查询并回滚。首次因响应字段不一致失败；在 `store.CreateEndpoint` 预设 UTC 微秒时间以匹配 MySQL `DATETIME(6)` 后，**用户反馈重跑成功**。不要把这说成助手自行运行了真实数据库测试。
 
-之后再推进 PATCH 启用/禁用、events/deliveries 表和事件事务幂等。当前尚无事件接口、Redis/Asynq、Outbox、投递、重试或签名发送功能，不能宣称可靠投递已实现。
+## 新增 PATCH 启用/禁用（当前待验证）
+
+- `PATCH /v1/endpoints/:id`：受 API Key 鉴权，请求只接收 `{"enabled":true/false}`，复用 POST 的 JSON 格式/大小限制；缺省和 null 值被拒绝，成功返回公开字段且不泄露签名密钥。非法 ID 400、不存在 404、其他数据库错误 500。
+- `store.SetEndpointEnabled` 显式 `Update("enabled", enabled)`（false 也会写入），随后查询记录；重复设置相同值也算成功，不依赖 MySQL 对未改变记录的 RowsAffected 行为。
+- 已增加 handler 测试、store 集成测试，并扩展 HTTP + MySQL 集成测试来覆盖禁用、重复禁用、启用及密钥不变；测试在事务内回滚，但会消耗自增 ID。普通测试与 vet / race 检查以本轮实际运行结果为准。**PATCH 的真实数据库集成测试仍需用户重跑**。
+- 这只是配置状态变更：事件接收、投递前禁用检查尚未实现，不能声称禁用能阻止实际投递。
+
+之后再推进 events/deliveries 表和事件事务幂等。当前尚无事件接口、Redis/Asynq、Outbox、投递、重试或签名发送功能，不能宣称可靠投递已实现。
 
 ## 下次恢复环境
 

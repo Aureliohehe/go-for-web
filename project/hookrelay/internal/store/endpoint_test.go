@@ -73,6 +73,24 @@ func TestEndpointRoundTripIntegration(t *testing.T) {
 			if got.CreatedAt.IsZero() {
 				t.Fatal("创建时间不应为空")
 			}
+			if got.CreatedAt.Format(time.RFC3339Nano) != endpoint.CreatedAt.Format(time.RFC3339Nano) {
+				t.Fatal("数据库创建时间与创建时返回的时间不一致")
+			}
+
+			for range 2 { // Updating to the same value must succeed as well.
+				updated, err := SetEndpointEnabled(ctx, tx, endpoint.ID, !tt.enabled)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if updated.Enabled != !tt.enabled || updated.ID != endpoint.ID ||
+					updated.URL != endpoint.URL || updated.SigningSecret != endpoint.SigningSecret ||
+					!updated.CreatedAt.Equal(endpoint.CreatedAt) {
+					t.Fatal("更新 enabled 不应改变接收端其他字段")
+				}
+			}
+			if _, err := SetEndpointEnabled(ctx, tx, 0, true); !errors.Is(err, ErrEndpointNotFound) {
+				t.Fatal("不存在的 ID 应返回 ErrEndpointNotFound")
+			}
 
 			if err := tx.WithContext(ctx).
 				Delete(&Endpoint{}, endpoint.ID).Error; err != nil {

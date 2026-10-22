@@ -74,6 +74,7 @@ func TestPostEndpoint(t *testing.T) {
 					endpoint.CreatedAt = createdAt
 					return tt.dbErr
 				},
+				nil, // PATCH is not exercised by this test.
 			)
 			request := httptest.NewRequest(http.MethodPost, "/v1/endpoints", strings.NewReader(tt.body)).WithContext(ctx)
 			request.Header.Set("Content-Type", tt.contentType)
@@ -138,6 +139,7 @@ func TestPostEndpointGeneratesNewSecret(t *testing.T) {
 			endpoint.ID = uint64(len(secrets))
 			return nil
 		},
+		nil, // PATCH is not exercised by this test.
 	)
 	for range 2 {
 		request := httptest.NewRequest(http.MethodPost, "/v1/endpoints", strings.NewReader(`{"url":"`+url+`"}`))
