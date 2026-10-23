@@ -10,7 +10,7 @@
 
 详见 [学习记录与下次起点](docs/learning-progress.md)。
 
-用户已验证真实 HTTP + MySQL 创建→查询闭环。PATCH 启用/禁用接口的真实数据库集成测试也已由用户确认通过；已添加 events/deliveries 增量迁移及事件请求摘要计算；迁移文件尚未在数据库执行，事件接收接口尚未实现。
+用户已验证真实 HTTP + MySQL 创建→查询闭环。PATCH 启用/禁用接口的真实数据库集成测试也已由用户确认通过；events/deliveries 增量迁移已由用户应用，已添加事件请求摘要及事件+投递同事务的存储层实现；该存储层的真实 MySQL 测试尚待运行，事件 HTTP 接口尚未实现。
 
 用户希望由助手写代码、自己理解逻辑；接下来讲解 PATCH 实现并在本地运行集成测试。
 
@@ -43,6 +43,6 @@
 
 ## 下一步
 
-1. 审核并按需手动应用 `migrations/000002_create_events_deliveries.up.sql`（不要重复执行）。
-2. 实现事件与投递记录同事务写入、并发幂等及相关集成测试，再接入 `POST /v1/events`。
+1. 运行 `HOOKRELAY_INTEGRATION=1 go test -count=1 -v ./internal/store`，验证事件+投递同事务、幂等和并发（用户已应用 `000002` 迁移，勿重复执行）。
+2. 确认存储层后接入 `POST /v1/events`；当前还不会发送 Webhook。
 3. 再进入异步投递、Outbox 和故障恢复。

@@ -1,7 +1,7 @@
 # 学习进度与下次起点
 
 > 已完成接收端创建→查询及 PATCH 启用/禁用的真实 HTTP + MySQL 验证（用户反馈通过）。
-> 新增 events/deliveries 增量迁移文件和事件请求摘要函数；迁移未由助手执行，事件事务与接口仍待实现。
+> 用户已确认 `000002` 迁移的两张表均创建成功；存储层事件+投递事务与幂等实现已写好，真实数据库测试待用户运行；事件 HTTP 接口尚未实现。
 
 ## 辅导方式与协作约定
 
@@ -152,7 +152,10 @@ git diff --check
 
 - 新增 `migrations/000002_create_events_deliveries.up.sql`，基于已存在的 endpoints 表创建 events 与 deliveries；`idempotency_key` 为字节精确的 VARBINARY(128) 全局唯一，`request_hash` 为 32 字节摘要，原始 payload 以 MEDIUMBLOB 保存，event_id 在 deliveries 中唯一。没有执行迁移、没有 AutoMigrate 或重置表；MySQL DDL 不是多表原子事务，手动应用前要确认数据库现状，失败时先检查是否部分创建而非盲目重跑。
 - 新增 `internal/store/event_hash.go`：SHA-256 摘要输入为端点 ID、带长度前缀的事件类型、带长度前缀的原始 payload 字节；幂等键不参与摘要，只负责查重定位。同一键同一内容应返回原 ID，同键不同内容将来返回 409；不同 JSON 空白会视为不同内容。单元测试覆盖输入变化和字段边界。
-- `go test ./...`、`go vet ./...`、`git diff --check` 通过；未执行新迁移或 MySQL 相关测试。**下一步由用户检查并应用迁移，再实现事件/投递事务与并发幂等测试，最后接 HTTP 事件接口。**
+- 用户确认已手动应用 `000002` 迁移，两张表均创建成功；助手未独立检查数据库，不要再次应用迁移。
+- 新增 `internal/store/event.go` 的 `CreateOrGetEventDelivery`：验证输入，先按幂等键查已提交事件，相同摘要返回原事件/投递 ID，不同摘要返回冲突；新事件在事务中锁定端点、检查 enabled，创建 event 与 pending delivery；唯一冲突时退出失败事务后重新读取已提交的赢家。端点禁用拒绝新事件，但已接受的事件重试可复用 ID。并发调用时应传入连接池上的 GORM db，不要共用外层长事务，否则冲突后的读取可能看不到并发提交。
+- 新增 `internal/store/event_test.go`：非法输入（无需 DB）、真实 MySQL 下正常创建、同键复用与冲突、禁用端点、注入第二次写入失败验证事件回滚、并发八请求仅一条投递。并发测试需要各自独立连接，不能包在共享外层事务中；生成唯一测试键，正常结束时只清理自己的事件/投递及端点，可能消耗自增 ID。进程崩溃可能留下测试记录，切勿清空业务表。
+- `go test ./...`、`go vet ./...`、`go test -race ./internal/store`、`git diff --check` 通过；**真实 MySQL 事件集成测试尚未由助手或用户验证**。下一步请用户运行 `HOOKRELAY_INTEGRATION=1 go test -count=1 -v ./internal/store`，通过后再接 HTTP 事件接口。
 - 当前尚无事件接口、Redis/Asynq、Outbox、投递、重试或签名发送功能，不能宣称可靠投递已实现。
 
 ## 下次恢复环境
