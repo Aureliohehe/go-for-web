@@ -75,6 +75,7 @@ func TestPatchEndpointEnabled(t *testing.T) {
 						SigningSecret: secret, CreatedAt: createdAt,
 					}, tt.dbErr
 				},
+				nil, nil,
 			)
 			request := httptest.NewRequest(http.MethodPatch, "/v1/endpoints/"+tt.id, strings.NewReader(tt.body)).WithContext(ctx)
 			request.Header.Set("Content-Type", tt.contentType)

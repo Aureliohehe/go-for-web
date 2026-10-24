@@ -109,11 +109,14 @@ func TestCreateOrGetEventDeliveryIntegration(t *testing.T) {
 	if err := db.Model(&Delivery{}).Where("event_id IN ?", []uint64{first.EventID, result.EventID}).Count(&count).Error; err != nil || count != 2 {
 		t.Fatal("each event must have exactly one delivery")
 	}
-	var delivery Delivery
-	if err := db.Where("id = ?", first.DeliveryID).Take(&delivery).Error; err != nil ||
+	delivery, err := FindDelivery(ctx, db, first.DeliveryID)
+	if err != nil ||
 		delivery.EventID != first.EventID || delivery.Status != "pending" ||
 		delivery.Generation != 1 || delivery.AttemptCount != 0 {
 		t.Fatal("first delivery has incorrect initial state")
+	}
+	if _, err := FindDelivery(ctx, db, 0); !errors.Is(err, ErrDeliveryNotFound) {
+		t.Fatal("missing delivery must return not found")
 	}
 
 	if _, err := CreateOrGetEventDelivery(ctx, db, EventInput{

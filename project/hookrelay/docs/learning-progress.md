@@ -1,11 +1,11 @@
 # 学习进度与下次起点
 
 > 已完成接收端创建→查询及 PATCH 启用/禁用的真实 HTTP + MySQL 验证（用户反馈通过）。
-> 用户已确认 `000002` 迁移的两张表均创建成功；存储层事件+投递事务与幂等实现已写好，真实数据库测试待用户运行；事件 HTTP 接口尚未实现。
+> 当前已打通 Redis/Asynq 异步投递、有限重试及状态回写；助手已在隔离临时 MySQL/Redis 上通过真实数据库与队列测试。下一步是 Outbox，当前仍有落库后入队前的故障窗口。
 
 ## 辅导方式与协作约定
 
-- 最新偏好：**助手写代码，用户理解逻辑；不懂的地方由助手讲解**。讲解按请求链路展开，不要默认把实现任务布置给用户。
+- 最新偏好：**助手写代码，用户理解逻辑；加快进度，专注核心逻辑，不写过多防御性代码**。讲解按请求链路展开，不要默认把实现任务布置给用户。
 - 用户要求助手贴出关键代码、按执行顺序讲解；在继续开发时沿用此讲解方式，不默认让用户写代码。
 - 可以直接维护进度文档。未明确要求时，不自动提交、推送或部署，不自动停止用户的服务。
 - 不读取、记录或输出真实密码、API Key、DSN。`.env` 保持本地私有。
@@ -158,13 +158,43 @@ git diff --check
 - `go test ./...`、`go vet ./...`、`go test -race ./internal/store`、`git diff --check` 通过；**真实 MySQL 事件集成测试尚未由助手或用户验证**。下一步请用户运行 `HOOKRELAY_INTEGRATION=1 go test -count=1 -v ./internal/store`，通过后再接 HTTP 事件接口。
 - 当前尚无事件接口、Redis/Asynq、Outbox、投递、重试或签名发送功能，不能宣称可靠投递已实现。
 
+## 本轮续接：事件 HTTP 接口
+
+- 新增 `internal/handler/event_create.go`，在鉴权路由组注册 `POST /v1/events`，由 `cmd/api/main.go` 注入现有 `CreateOrGetEventDelivery`，不添加 service 层或新事务逻辑。
+- 输入为字符串 `endpoint_id`、`event_type`、`payload`；`Idempotency-Key` 从请求头读取。使用 `json.RawMessage` 保留 payload 原始字节，复用现有 JSON 解码器并参数化大小限制。
+- 首次接收返回 202，同内容复用返回 200；响应含字符串 `event_id`、`delivery_id` 和 `reused`。非法输入 400、端点不存在 404、禁用或幂等冲突 409、数据库错误 500。
+- 新增核心 handler 测试：参数/context 传递、原始 payload、首次与重复响应、鉴权、格式与大小限制、业务错误映射。`go test ./...` 和 `go vet ./...` 已通过，未启用真实 MySQL 集成测试。
+- 没有修改原有 `internal/store/event.go` 的用户未提交改动，也没有执行迁移、读取 `.env` 或启动/停止服务。
+- 下一步先验证现有事件数据库测试及 README 中 HTTP 请求，再补投递查询和 Sender，随后进入 Asynq。当前仍不发送 Webhook。
+
+## 本轮续接：投递查询与 Sender
+
+- `internal/store/delivery.go` + `internal/handler/delivery.go`：新增受鉴权保护的 `GET /v1/deliveries/:id`，返回字符串 ID、状态、generation、attempt_count 及时间。复用现有 deliveries 表，无新迁移。
+- `internal/delivery/sender.go`：独立单次 HTTP POST，原样发送 payload 和 `X-Webhook-ID`；2xx 成功，网络/超时/408/429/5xx 可重试，3xx 不跟随，其余失败不重试。设置客户端超时、传递 context、最多读取 4 KiB 响应体，不持久化响应正文。
+- Sender 只分类、不实际重试，也不读写数据库。尚无 HMAC 或 Retry-After；只供受控本地测试，不作为公网投递能力。
+- 新增查询 handler 测试与 Sender 本地 HTTP 测试（状态分类、原始请求体、禁止重定向、超时、取消、网络失败）；现有 MySQL 事件集成测试增加 FindDelivery 的初始状态和不存在检查，尚未运行真实数据库测试。
+- `go test ./...`、`go vet ./...`、`go test -race ./internal/handler ./internal/delivery` 通过。未读取 `.env`、未执行迁移、未启动/停止用户服务。
+- **下一步：Redis/Asynq + 独立 Worker，接通已保存事件到 Sender 的异步链路。** 先明确直接入队存在故障窗口，随后接 Outbox。当前查询到的投递仍保持 pending，不能宣称已有自动投递。
+
+## 最新进度：Asynq 异步闭环
+
+- 增加 Asynq v0.25.1、`REDIS_ADDR`（默认 `127.0.0.1:16379`）与 Compose Redis 7.4/AOF 配置；本轮无新 SQL 迁移。
+- `internal/service/event.go`：先复用存储层事务，再入队；幂等重试也尝试补入队。失败返回 503 + `persisted=true` + 原 ID，禁止误导为“没有保存”。稳定 TaskID 冲突视为已入队。
+- `internal/task/delivery.go`：任务 `webhook:deliver`、队列 `webhooks`，只传 delivery_id/generation；当前固定 generation=1，尚无重放。默认最多 3 次领取，HTTP 5s、任务 20s、租约 30s。
+- `internal/store/delivery_work.go`：短事务锁定投递、跳过终态/旧版本、检查端点、领取并增加次数；回写以 generation+attempt_count 限制旧结果。计数是领取次数，崩溃在 HTTP 前也消耗预算。
+- `internal/delivery/worker.go` + `cmd/worker`：独立 Worker 并发 1，复查允许 URL，执行 Sender；临时失败交给 Asynq 延迟重试，永久失败/耗尽预算置 failed；日志仅含 ID、状态、状态码、耗时，不存原始 HTTP 错误详情。
+- `cmd/receiver`：本地测试服务，`-status 500`、`-delay 8s` 可模拟错误；没有验签和持久化去重。
+- **助手实际验证**：`go test ./...`、`go vet ./...`、相关包 race 测试；独立临时 MySQL 8.0.42 和 Redis 上执行 `HOOKRELAY_INTEGRATION=1 go test -count=1 -race ./internal/store ./cmd/api ./tests/integration` 通过（含事件事务回滚、并发幂等、租约/执行令牌及真实队列成功/500后成功/400失败/503耗尽预算）。
+- 另构建并启动 API、Worker、Receiver 三个进程，真实 HTTP 验证首次 202、重复 200、最终 succeeded/attempt_count=1、同键改内容 409。测试结束已停止本轮创建的临时进程；没有读取用户 `.env`、操作已有数据库或用户服务。Compose Redis 路径及 Worker 强杀恢复尚未验证。
+- **下一步：Outbox + Dispatcher**，替换 API 的直接入队，解决保存成功后未入队的窗口。Redis 丢数据、数据库写回长期失败导致非终态遗留仍需后续对账；不能宣称已可靠投递。第一版仅运行单 Worker，尚未做多实例故障测试。
+
 ## 下次恢复环境
 
 在项目根目录执行：
 
 ```bash
 cd /root/hello-gp/project/hookrelay
-docker compose up -d --wait mysql
+docker compose up -d --wait mysql redis
 
 # 只加载自己可信的本地配置文件。
 set -a
@@ -176,8 +206,12 @@ if [ -z "${API_KEY:-}" ]; then
   export API_KEY="$(openssl rand -hex 32)"
 fi
 export ALLOWED_ENDPOINT_URL="${ALLOWED_ENDPOINT_URL:-http://127.0.0.1:9090/webhook}"
+export REDIS_ADDR="${REDIS_ADDR:-127.0.0.1:16379}"
 
 go run ./cmd/api
+# 另外两个终端（Worker 也需加载上述环境）：
+# go run ./cmd/worker
+# go run ./cmd/receiver
 ```
 
 - 临时生成的密钥不会自动写入 `.env`；另一个终端也不会自动继承它。不在对话中粘贴密钥。
@@ -188,12 +222,12 @@ go run ./cmd/api
 - 若执行集成测试，需数据库运行、迁移已应用，且当前终端已导出数据库配置：
 
 ```bash
-HOOKRELAY_INTEGRATION=1 go test -count=1 -v ./internal/store ./cmd/api
+HOOKRELAY_INTEGRATION=1 go test -count=1 -v ./internal/store ./cmd/api ./tests/integration
 ```
 
 ## 收尾与保存边界
 
-- 本次收尾只保存进度文档、同步 README，不自动提交、推送或部署，不替用户停止服务。
+- 默认保留代码和进度在工作区，不自动提交、推送或部署，不替用户停止服务。
 - 收尾时 Git 仍有业务代码修改和新增文件；下次先检查 `git status --short`，不要覆盖或清理这些改动。用户可能在两次会话间自行提交。
 - 用户可以 Ctrl+C 停止 API，再执行 `docker compose stop mysql` 保留数据。
 - 不执行 `docker compose down -v`；它会删除数据库数据卷。

@@ -12,6 +12,7 @@ import (
 // Config contains settings for the API and the database.
 // Never log this struct: it contains the database password.
 type Config struct {
+	RedisAddr          string
 	HTTPAddr           string
 	MySQLHost          string
 	MySQLPort          string
@@ -34,6 +35,7 @@ func load(getenv func(string) string) (Config, error) {
 		return fallback
 	}
 	cfg := Config{
+		RedisAddr:          value("REDIS_ADDR", "127.0.0.1:16379"),
 		HTTPAddr:           value("HTTP_ADDR", "127.0.0.1:8080"),
 		MySQLHost:          value("MYSQL_HOST", "127.0.0.1"),
 		MySQLPort:          value("MYSQL_PORT", "13306"),

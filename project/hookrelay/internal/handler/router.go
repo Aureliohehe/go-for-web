@@ -38,6 +38,8 @@ func NewAPIRouter(
 	findEndpoint EndpointFinder,
 	createEndpoint EndpointCreator,
 	updateEndpointEnabled EndpointEnabledUpdater,
+	createEvent EventCreator,
+	findDelivery DeliveryFinder,
 ) *gin.Engine {
 	router := NewRouter(pingDatabase)
 
@@ -46,6 +48,8 @@ func NewAPIRouter(
 	v1.GET("/endpoints/:id", GetEndpoint(findEndpoint))
 	v1.POST("/endpoints", PostEndpoint(allowedEndpointURL, createEndpoint))
 	v1.PATCH("/endpoints/:id", PatchEndpointEnabled(updateEndpointEnabled))
+	v1.POST("/events", PostEvent(createEvent))
+	v1.GET("/deliveries/:id", GetDelivery(findDelivery))
 
 	return router
 }

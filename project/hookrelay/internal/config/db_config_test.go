@@ -17,6 +17,7 @@ func TestLoadDBConfigMissingPassword(t *testing.T) {
 }
 
 func TestLoadDBConfigSuccess(t *testing.T) {
+	t.Setenv("REDIS_ADDR", "127.0.0.1:16379")
 	t.Setenv("HTTP_ADDR", "")
 	t.Setenv("MYSQL_HOST", "127.0.0.1")
 	t.Setenv("MYSQL_PORT", "13306")
@@ -35,6 +36,7 @@ func TestLoadDBConfigSuccess(t *testing.T) {
 		HTTPAddr:      "127.0.0.1:8080",
 		MySQLHost:     "127.0.0.1",
 		MySQLPort:     "13306",
+		RedisAddr:     "127.0.0.1:16379",
 		MySQLUser:     "test_user",
 		MySQLPassword: "test_password",
 		MySQLDatabase: "test_db",
@@ -46,6 +48,7 @@ func TestLoadDBConfigSuccess(t *testing.T) {
 }
 
 func TestLoadDBConfigDefaults(t *testing.T) {
+	t.Setenv("REDIS_ADDR", "")
 	t.Setenv("HTTP_ADDR", "")
 	t.Setenv("MYSQL_HOST", "")
 	t.Setenv("MYSQL_PORT", "")
@@ -62,6 +65,7 @@ func TestLoadDBConfigDefaults(t *testing.T) {
 		HTTPAddr:      "127.0.0.1:8080",
 		MySQLHost:     "127.0.0.1",
 		MySQLPort:     "13306",
+		RedisAddr:     "127.0.0.1:16379",
 		MySQLUser:     "hookrelay",
 		MySQLPassword: "test_password",
 		MySQLDatabase: "hookrelay",

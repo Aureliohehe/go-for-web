@@ -23,13 +23,16 @@ type Event struct {
 }
 
 type Delivery struct {
-	ID           uint64 `gorm:"primaryKey;autoIncrement"`
-	EventID      uint64
-	Status       string
-	Generation   uint32
-	AttemptCount uint32
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	ID             uint64 `gorm:"primaryKey;autoIncrement"`
+	EventID        uint64
+	Status         string
+	Generation     uint32
+	AttemptCount   uint32
+	LastHTTPStatus *int
+	LastError      *string
+	LeaseUntil     *time.Time
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 type EventInput struct {
@@ -56,6 +59,7 @@ var (
 // No queue task or webhook is created here. A repeated key returns the original
 // IDs only when endpoint, event type and raw payload bytes are unchanged.
 // Pass a pool-backed db, not a long-lived outer transaction: after a unique
+
 // conflict the winner must be read from a fresh committed snapshot.
 func CreateOrGetEventDelivery(ctx context.Context, db *gorm.DB, input EventInput) (EventResult, error) {
 	return createOrGetEventDelivery(ctx, db, input, func(tx *gorm.DB, delivery *Delivery) error {

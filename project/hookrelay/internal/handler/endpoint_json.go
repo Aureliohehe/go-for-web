@@ -15,12 +15,16 @@ const maxEndpointBodyBytes = 4096
 // decodeEndpointJSON is shared by POST and PATCH so they enforce the same
 // content type, size limit and single strict JSON value.
 func decodeEndpointJSON(c *gin.Context, input any) bool {
+	return decodeJSON(c, input, maxEndpointBodyBytes)
+}
+
+func decodeJSON(c *gin.Context, input any, maxBytes int64) bool {
 	mediaType, _, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
 	if err != nil || mediaType != "application/json" {
 		c.JSON(http.StatusUnsupportedMediaType, gin.H{"error": "unsupported_media_type"})
 		return false
 	}
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxEndpointBodyBytes)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
 	decoder := json.NewDecoder(c.Request.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(input); err != nil {
