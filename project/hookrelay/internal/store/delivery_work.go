@@ -12,9 +12,10 @@ import (
 var ErrDeliveryBusy = errors.New("delivery lease is active")
 
 type DeliveryWork struct {
-	Delivery Delivery
-	Event    Event
-	Endpoint Endpoint
+	AttemptID uint64
+	Delivery  Delivery
+	Event     Event
+	Endpoint  Endpoint
 }
 
 type DeliveryStore struct{ DB *gorm.DB }
@@ -35,7 +36,7 @@ func (s DeliveryStore) Claim(ctx context.Context, id uint64, generation uint32, 
 		if d.Generation != generation || d.Status == "succeeded" || d.Status == "failed" {
 			return nil
 		}
-		now := time.Now().UTC()
+		now := time.Now().UTC().Truncate(time.Microsecond)
 		if d.LeaseUntil != nil && d.LeaseUntil.After(now) {
 			return ErrDeliveryBusy
 		}
@@ -66,7 +67,14 @@ func (s DeliveryStore) Claim(ctx context.Context, id uint64, generation uint32, 
 		}).Error; err != nil {
 			return err
 		}
-		work = &DeliveryWork{Delivery: d, Event: event, Endpoint: endpoint}
+		attempt := DeliveryAttempt{
+			DeliveryID: d.ID, Generation: d.Generation, AttemptNumber: d.AttemptCount,
+			Status: "processing", StartedAt: now,
+		}
+		if err := tx.Create(&attempt).Error; err != nil {
+			return err
+		}
+		work = &DeliveryWork{AttemptID: attempt.ID, Delivery: d, Event: event, Endpoint: endpoint}
 		return nil
 	})
 	return work, err
@@ -74,11 +82,42 @@ func (s DeliveryStore) Claim(ctx context.Context, id uint64, generation uint32, 
 
 // Attempt count is an execution token: a late result cannot overwrite a newer
 // attempt or generation. A crashed attempt consumes budget even before HTTP.
-func (s DeliveryStore) Finish(ctx context.Context, work *DeliveryWork, status string, httpStatus int, reason string) error {
-	return s.DB.WithContext(ctx).Model(&Delivery{}).
-		Where("id = ? AND generation = ? AND attempt_count = ? AND status = ?",
-			work.Delivery.ID, work.Delivery.Generation, work.Delivery.AttemptCount, "processing").
-		Updates(map[string]any{
-			"status": status, "last_http_status": httpStatus, "last_error": reason, "lease_until": nil,
-		}).Error
+func (s DeliveryStore) Finish(ctx context.Context, work *DeliveryWork, status string, httpStatus int, reason string, latency time.Duration) error {
+	return s.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Lock/update delivery before history, in the same order as Claim.
+		updated := tx.Model(&Delivery{}).
+			Where("id = ? AND generation = ? AND attempt_count = ? AND status = ?",
+				work.Delivery.ID, work.Delivery.Generation, work.Delivery.AttemptCount, "processing").
+			Updates(map[string]any{
+				"status": status, "last_http_status": httpStatus, "last_error": reason, "lease_until": nil,
+			})
+		if updated.Error != nil {
+			return updated.Error
+		}
+		var code *int
+		if httpStatus != 0 {
+			code = &httpStatus
+		}
+		var elapsed *int64
+		if reason != "endpoint_not_allowed" {
+			ms := latency.Milliseconds()
+			elapsed = &ms
+		}
+		// A late result may finish its own history, but cannot change a newer
+		// delivery execution. An already finished history row is immutable.
+		history := tx.Model(&DeliveryAttempt{}).
+			Where("id = ? AND delivery_id = ? AND generation = ? AND attempt_number = ? AND finished_at IS NULL",
+				work.AttemptID, work.Delivery.ID, work.Delivery.Generation, work.Delivery.AttemptCount).
+			Updates(map[string]any{
+				"status": status, "finished_at": time.Now().UTC().Truncate(time.Microsecond),
+				"http_status": code, "error_class": reason, "latency_ms": elapsed,
+			})
+		if history.Error != nil {
+			return history.Error
+		}
+		if updated.RowsAffected != 0 && history.RowsAffected == 0 {
+			return errors.New("delivery attempt missing or already finished")
+		}
+		return nil
+	})
 }

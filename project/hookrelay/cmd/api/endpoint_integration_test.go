@@ -57,7 +57,7 @@ func TestEndpointHTTPMySQLRoundTrip(t *testing.T) {
 		func(ctx context.Context, id uint64, enabled bool) (store.Endpoint, error) {
 			return store.SetEndpointEnabled(ctx, tx, id, enabled)
 		},
-		nil, nil,
+		nil, nil, nil,
 	)
 	server := httptest.NewServer(router)
 	defer server.Close()

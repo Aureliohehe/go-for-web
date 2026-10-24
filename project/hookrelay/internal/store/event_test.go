@@ -26,7 +26,7 @@ func TestCreateOrGetEventDeliveryRejectsInvalidInput(t *testing.T) {
 		{EndpointID: 1, IdempotencyKey: "key", EventType: "created", Payload: make([]byte, 256*1024+1)},
 	}
 	for _, input := range tests {
-		if _, err := CreateOrGetEventDelivery(context.Background(), nil, input); !errors.Is(err, ErrInvalidEvent) {
+		if _, err := CreateOrGetEventDelivery(context.Background(), nil, input, 10000); !errors.Is(err, ErrInvalidEvent) {
 			t.Fatal("invalid input must be rejected before accessing the database")
 		}
 	}
@@ -34,7 +34,7 @@ func TestCreateOrGetEventDeliveryRejectsInvalidInput(t *testing.T) {
 
 func TestCreateOrGetEventDeliveryIntegration(t *testing.T) {
 	if os.Getenv("HOOKRELAY_INTEGRATION") != "1" {
-		t.Skip("set HOOKRELAY_INTEGRATION=1 after applying migrations 000001..000003")
+		t.Skip("set HOOKRELAY_INTEGRATION=1 after applying migrations 000001..000004")
 	}
 	cfg, err := config.Load()
 	if err != nil {
@@ -63,7 +63,7 @@ func TestCreateOrGetEventDeliveryIntegration(t *testing.T) {
 	if _, err := createOrGetEventDelivery(ctx, db, EventInput{
 		IdempotencyKey: rollbackKey, EndpointID: endpoint.ID,
 		EventType: "order.created", Payload: []byte(`{"id":1}`),
-	}, func(*gorm.DB, *Delivery) error { return failedDelivery }, nil); !errors.Is(err, failedDelivery) {
+	}, 10000, func(*gorm.DB, *Delivery) error { return failedDelivery }, nil); !errors.Is(err, failedDelivery) {
 		t.Fatal("a failed delivery insert must fail the whole transaction")
 	}
 	var count int64
@@ -76,7 +76,7 @@ func TestCreateOrGetEventDeliveryIntegration(t *testing.T) {
 	failedOutbox := errors.New("injected outbox write failure")
 	if _, err := createOrGetEventDelivery(ctx, db, EventInput{
 		IdempotencyKey: rollbackKey, EndpointID: endpoint.ID, EventType: "test", Payload: []byte(`{}`),
-	}, func(tx *gorm.DB, d *Delivery) error {
+	}, 10000, func(tx *gorm.DB, d *Delivery) error {
 		err := tx.Create(d).Error
 		rolledBackDeliveryID = d.ID
 		return err
@@ -91,33 +91,33 @@ func TestCreateOrGetEventDeliveryIntegration(t *testing.T) {
 	}
 
 	input := EventInput{IdempotencyKey: key, EndpointID: endpoint.ID, EventType: "order.created", Payload: []byte(`{"id":1}`)}
-	first, err := CreateOrGetEventDelivery(ctx, db, input)
+	first, err := CreateOrGetEventDelivery(ctx, db, input, 10000)
 	if err != nil || first.EventID == 0 || first.DeliveryID == 0 || first.Reused {
 		t.Fatal("first submission must create an event and delivery")
 	}
-	again, err := CreateOrGetEventDelivery(ctx, db, input)
+	again, err := CreateOrGetEventDelivery(ctx, db, input, 10000)
 	if err != nil || !again.Reused || again.EventID != first.EventID || again.DeliveryID != first.DeliveryID {
 		t.Fatal("repeated key and content must return the same IDs")
 	}
 	changed := input
 	changed.Payload = []byte(`{ "id":1 }`)
-	if _, err := CreateOrGetEventDelivery(ctx, db, changed); !errors.Is(err, ErrIdempotencyConflict) {
+	if _, err := CreateOrGetEventDelivery(ctx, db, changed, 10000); !errors.Is(err, ErrIdempotencyConflict) {
 		t.Fatal("same key and different raw payload must conflict")
 	}
 	changed = input
 	changed.EventType = "order.updated"
-	if _, err := CreateOrGetEventDelivery(ctx, db, changed); !errors.Is(err, ErrIdempotencyConflict) {
+	if _, err := CreateOrGetEventDelivery(ctx, db, changed, 10000); !errors.Is(err, ErrIdempotencyConflict) {
 		t.Fatal("same key and different event type must conflict")
 	}
 	changed = input
 	changed.EndpointID = endpoint.ID + 1
-	if _, err := CreateOrGetEventDelivery(ctx, db, changed); !errors.Is(err, ErrIdempotencyConflict) {
+	if _, err := CreateOrGetEventDelivery(ctx, db, changed, 10000); !errors.Is(err, ErrIdempotencyConflict) {
 		t.Fatal("same key and different endpoint must conflict")
 	}
 
 	other := input
 	other.IdempotencyKey = otherKey
-	result, err := CreateOrGetEventDelivery(ctx, db, other)
+	result, err := CreateOrGetEventDelivery(ctx, db, other, 10000)
 	if err != nil || result.Reused || result.EventID == first.EventID || result.DeliveryID == first.DeliveryID {
 		t.Fatal("a different key must create a new event and delivery")
 	}
@@ -140,7 +140,7 @@ func TestCreateOrGetEventDeliveryIntegration(t *testing.T) {
 
 	if _, err := CreateOrGetEventDelivery(ctx, db, EventInput{
 		IdempotencyKey: missingKey, EndpointID: ^uint64(0), EventType: input.EventType, Payload: input.Payload,
-	}); !errors.Is(err, ErrEndpointNotFound) {
+	}, 10000); !errors.Is(err, ErrEndpointNotFound) {
 		t.Fatal("nonexistent endpoint must reject a new event")
 	}
 	if _, err := SetEndpointEnabled(ctx, db, endpoint.ID, false); err != nil {
@@ -148,10 +148,10 @@ func TestCreateOrGetEventDeliveryIntegration(t *testing.T) {
 	}
 	if _, err := CreateOrGetEventDelivery(ctx, db, EventInput{
 		IdempotencyKey: concurrentKey, EndpointID: endpoint.ID, EventType: input.EventType, Payload: input.Payload,
-	}); !errors.Is(err, ErrEndpointDisabled) {
+	}, 10000); !errors.Is(err, ErrEndpointDisabled) {
 		t.Fatal("disabled endpoint must reject a new event")
 	}
-	if again, err := CreateOrGetEventDelivery(ctx, db, input); err != nil || !again.Reused || again.EventID != first.EventID {
+	if again, err := CreateOrGetEventDelivery(ctx, db, input, 10000); err != nil || !again.Reused || again.EventID != first.EventID {
 		t.Fatal("a retry of an accepted event must still work after disabling")
 	}
 	if _, err := SetEndpointEnabled(ctx, db, endpoint.ID, true); err != nil {
@@ -159,7 +159,7 @@ func TestCreateOrGetEventDeliveryIntegration(t *testing.T) {
 	}
 	if _, err := CreateOrGetEventDelivery(ctx, db, EventInput{
 		IdempotencyKey: concurrentKey, EndpointID: 0, EventType: input.EventType,
-	}); !errors.Is(err, ErrInvalidEvent) {
+	}, 10000); !errors.Is(err, ErrInvalidEvent) {
 		t.Fatal("zero endpoint ID must be invalid")
 	}
 
@@ -178,7 +178,7 @@ func TestCreateOrGetEventDeliveryIntegration(t *testing.T) {
 			results[i], errs[i] = CreateOrGetEventDelivery(ctx, db, EventInput{
 				IdempotencyKey: concurrentKey, EndpointID: endpoint.ID,
 				EventType: input.EventType, Payload: input.Payload,
-			})
+			}, 10000)
 		}()
 	}
 	close(start)
@@ -224,6 +224,9 @@ func cleanupTestEvents(t *testing.T, db *gorm.DB, endpointID uint64, keys []stri
 		return
 	}
 	for _, event := range events {
+		if err := db.Where("delivery_id IN (?)", db.Model(&Delivery{}).Select("id").Where("event_id = ?", event.ID)).Delete(&DeliveryAttempt{}).Error; err != nil {
+			t.Error("delete test attempt history failed")
+		}
 		if err := db.Where("delivery_id IN (?)", db.Model(&Delivery{}).Select("id").Where("event_id = ?", event.ID)).Delete(&Outbox{}).Error; err != nil {
 			t.Error("delete test outbox failed")
 		}

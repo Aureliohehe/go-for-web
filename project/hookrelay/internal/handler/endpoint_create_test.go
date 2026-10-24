@@ -75,7 +75,7 @@ func TestPostEndpoint(t *testing.T) {
 					return tt.dbErr
 				},
 				nil, // PATCH is not exercised by this test.
-				nil, nil,
+				nil, nil, nil,
 			)
 			request := httptest.NewRequest(http.MethodPost, "/v1/endpoints", strings.NewReader(tt.body)).WithContext(ctx)
 			request.Header.Set("Content-Type", tt.contentType)
@@ -141,7 +141,7 @@ func TestPostEndpointGeneratesNewSecret(t *testing.T) {
 			return nil
 		},
 		nil, // PATCH is not exercised by this test.
-		nil, nil,
+		nil, nil, nil,
 	)
 	for range 2 {
 		request := httptest.NewRequest(http.MethodPost, "/v1/endpoints", strings.NewReader(`{"url":"`+url+`"}`))

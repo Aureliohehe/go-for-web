@@ -17,6 +17,7 @@ import (
 
 	"github.com/aurelio/hookrelay/internal/config"
 	"github.com/aurelio/hookrelay/internal/delivery"
+	"github.com/aurelio/hookrelay/internal/handler"
 	"github.com/aurelio/hookrelay/internal/outbox"
 	"github.com/aurelio/hookrelay/internal/store"
 	"github.com/aurelio/hookrelay/internal/task"
@@ -92,6 +93,9 @@ func TestAsyncDelivery(t *testing.T) {
 	var results []store.EventResult
 	defer func() {
 		for _, result := range results {
+			if err := db.Where("delivery_id = ?", result.DeliveryID).Delete(&store.DeliveryAttempt{}).Error; err != nil {
+				t.Error(err)
+			}
 			if err := db.Where("delivery_id = ?", result.DeliveryID).Delete(&store.Outbox{}).Error; err != nil {
 				t.Error(err)
 			}
@@ -131,6 +135,11 @@ func TestAsyncDelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer server.Shutdown()
+	api := httptest.NewServer(handler.NewAPIRouter(pool.PingContext, "test-key", receiver.URL, nil, nil, nil, nil, nil,
+		func(ctx context.Context, id, after uint64, limit int) ([]store.DeliveryAttempt, error) {
+			return store.ListDeliveryAttempts(ctx, db, id, after, limit)
+		}))
+	defer api.Close()
 	enqueue := func(ctx context.Context, id uint64, generation uint32) error {
 		body, _ := json.Marshal(task.Payload{DeliveryID: id, Generation: generation})
 		_, err := client.EnqueueContext(ctx, asynq.NewTask(task.TypeDelivery, body), asynq.Queue(queue),
@@ -145,7 +154,7 @@ func TestAsyncDelivery(t *testing.T) {
 	create := func(t *testing.T, name string) store.EventResult {
 		t.Helper()
 		input := store.EventInput{EndpointID: endpoint.ID, IdempotencyKey: uuid.NewString(), EventType: "test", Payload: []byte(fmt.Sprintf("%q", name))}
-		result, err := store.CreateOrGetEventDelivery(ctx, db, input)
+		result, err := store.CreateOrGetEventDelivery(ctx, db, input, 10000)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -222,6 +231,58 @@ func TestAsyncDelivery(t *testing.T) {
 			mu.Unlock()
 			if int(d.AttemptCount) != tt.attempts || sent != tt.attempts {
 				t.Fatalf("attempts=%d HTTP sends=%d", d.AttemptCount, sent)
+			}
+			history, err := store.ListDeliveryAttempts(ctx, db, result.DeliveryID, 0, 100)
+			if err != nil || len(history) != tt.attempts {
+				t.Fatalf("attempt history: rows=%d err=%v", len(history), err)
+			}
+			for i, a := range history {
+				wantCode, wantStatus := 204, tt.status
+				if tt.name == "permanent" {
+					wantCode = 400
+				}
+				if tt.name == "exhausted" {
+					wantCode = 503
+				}
+				if i < len(history)-1 {
+					wantStatus = "retrying"
+					if tt.name == "temporary" {
+						wantCode = 500
+					}
+				}
+				if a.AttemptNumber != uint32(i+1) || a.Generation != 1 || a.Status != wantStatus || a.HTTPStatus == nil || *a.HTTPStatus != wantCode || a.FinishedAt == nil || a.LatencyMS == nil {
+					t.Fatalf("incorrect attempt: %+v", a)
+				}
+			}
+			// Exercise the real authenticated HTTP route and GORM cursor query.
+			after := "0"
+			for i := 0; i < tt.attempts; i++ {
+				req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/v1/deliveries/%d/attempts?limit=1&after=%s", api.URL, result.DeliveryID, after), nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				req.Header.Set("X-API-Key", "test-key")
+				resp, err := api.Client().Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var page struct {
+					Items []struct {
+						ID     string `json:"id"`
+						Number int    `json:"attempt_number"`
+						Status string `json:"status"`
+					} `json:"items"`
+					Next string `json:"next_after"`
+				}
+				err = json.NewDecoder(resp.Body).Decode(&page)
+				resp.Body.Close()
+				if err != nil || resp.StatusCode != 200 || len(page.Items) != 1 || page.Items[0].Number != i+1 || page.Items[0].Status != history[i].Status {
+					t.Fatalf("invalid history HTTP page: %+v err=%v", page, err)
+				}
+				if i < tt.attempts-1 && page.Next != page.Items[0].ID || i == tt.attempts-1 && page.Next != "" {
+					t.Fatal("incorrect next cursor")
+				}
+				after = page.Next
 			}
 			waitQueueFinal(t, result.DeliveryID, tt.status == "failed")
 			if entryFor(t, result.DeliveryID).Status != "published" {
@@ -302,6 +363,9 @@ func TestAsyncDelivery(t *testing.T) {
 		mu.Unlock()
 		if sent != 1 {
 			t.Fatalf("completed delivery sent again: %d", sent)
+		}
+		if history, err := store.ListDeliveryAttempts(ctx, db, result.DeliveryID, 0, 100); err != nil || len(history) != 1 {
+			t.Fatal("duplicate task created extra history")
 		}
 		if got := entryFor(t, result.DeliveryID); got.Status != "published" || got.PublishAttempts != 2 {
 			t.Fatal("duplicate publication not completed")

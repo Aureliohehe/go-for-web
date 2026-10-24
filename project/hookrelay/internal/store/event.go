@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"time"
@@ -49,6 +50,7 @@ type EventResult struct {
 }
 
 var (
+	ErrBacklogFull         = errors.New("unfinished delivery backlog is full")
 	ErrInvalidEvent        = errors.New("invalid event")
 	ErrEndpointDisabled    = errors.New("endpoint disabled")
 	ErrIdempotencyConflict = errors.New("idempotency key reused with different content")
@@ -58,11 +60,12 @@ var (
 // CreateOrGetEventDelivery persists an event, pending delivery and outbox together.
 // No Redis task or webhook is created here. A repeated key returns the original
 // IDs only when endpoint, event type and raw payload bytes are unchanged.
+// maxPending must be positive and configured identically on all API instances.
 // Pass a pool-backed db, not a long-lived outer transaction: after a unique
 
 // conflict the winner must be read from a fresh committed snapshot.
-func CreateOrGetEventDelivery(ctx context.Context, db *gorm.DB, input EventInput) (EventResult, error) {
-	return createOrGetEventDelivery(ctx, db, input, func(tx *gorm.DB, delivery *Delivery) error {
+func CreateOrGetEventDelivery(ctx context.Context, db *gorm.DB, input EventInput, maxPending int64) (EventResult, error) {
+	return createOrGetEventDelivery(ctx, db, input, maxPending, func(tx *gorm.DB, delivery *Delivery) error {
 		return tx.Create(delivery).Error
 	}, func(tx *gorm.DB, entry *Outbox) error {
 		return tx.Create(entry).Error
@@ -70,7 +73,7 @@ func CreateOrGetEventDelivery(ctx context.Context, db *gorm.DB, input EventInput
 }
 
 // Insertion seams allow rollback tests without altering shared schema.
-func createOrGetEventDelivery(ctx context.Context, db *gorm.DB, input EventInput,
+func createOrGetEventDelivery(ctx context.Context, db *gorm.DB, input EventInput, maxPending int64,
 	insertDelivery func(*gorm.DB, *Delivery) error,
 	insertOutbox func(*gorm.DB, *Outbox) error,
 ) (EventResult, error) {
@@ -83,7 +86,17 @@ func createOrGetEventDelivery(ctx context.Context, db *gorm.DB, input EventInput
 	}
 
 	var result EventResult
+	// READ COMMITTED counts current backlog after obtaining the admission gate.
 	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockAdmission(tx); err != nil {
+			return err
+		}
+		// Another request may have committed the same key while we waited.
+		// Recheck before capacity: idempotent retries do not need a new slot.
+		if existing, found, err := findEventByKey(ctx, tx, input.IdempotencyKey, hash); err != nil || found {
+			result = existing
+			return err
+		}
 		// Serialize acceptance against disabling this endpoint. A replay of an
 		// existing key was handled above, even when the endpoint is now disabled.
 		var endpoint Endpoint
@@ -97,6 +110,9 @@ func createOrGetEventDelivery(ctx context.Context, db *gorm.DB, input EventInput
 		}
 		if !endpoint.Enabled {
 			return ErrEndpointDisabled
+		}
+		if err := checkBacklog(tx, maxPending); err != nil {
+			return err
 		}
 
 		now := time.Now().UTC().Truncate(time.Microsecond)
@@ -130,7 +146,7 @@ func createOrGetEventDelivery(ctx context.Context, db *gorm.DB, input EventInput
 		}
 		result = EventResult{EventID: event.ID, DeliveryID: delivery.ID}
 		return nil
-	})
+	}, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if errors.Is(err, errDuplicateEventKey) {
 		// Unique-key arbitration waited for the competing transaction to finish.
 		// Read after rollback in a fresh transaction/snapshot.

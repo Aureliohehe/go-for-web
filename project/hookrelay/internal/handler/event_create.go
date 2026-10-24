@@ -38,6 +38,11 @@ func PostEvent(create EventCreator) gin.HandlerFunc {
 			IdempotencyKey: c.GetHeader("Idempotency-Key"),
 			EndpointID:     endpointID, EventType: input.EventType, Payload: input.Payload,
 		})
+		if errors.Is(err, store.ErrBacklogFull) {
+			c.Header("Retry-After", "5")
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "backlog_full", "persisted": false})
+			return
+		}
 		if err != nil {
 			status, code := http.StatusInternalServerError, "internal_error"
 			switch {

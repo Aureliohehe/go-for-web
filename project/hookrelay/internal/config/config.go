@@ -12,15 +12,16 @@ import (
 // Config contains settings for the API and the database.
 // Never log this struct: it contains the database password.
 type Config struct {
-	RedisAddr          string
-	HTTPAddr           string
-	MySQLHost          string
-	MySQLPort          string
-	MySQLDatabase      string
-	MySQLUser          string
-	MySQLPassword      string
-	APIKey             string
-	AllowedEndpointURL string
+	MaxPendingDeliveries int64
+	RedisAddr            string
+	HTTPAddr             string
+	MySQLHost            string
+	MySQLPort            string
+	MySQLDatabase        string
+	MySQLUser            string
+	MySQLPassword        string
+	APIKey               string
+	AllowedEndpointURL   string
 }
 
 func Load() (Config, error) {
@@ -45,6 +46,11 @@ func load(getenv func(string) string) (Config, error) {
 		APIKey:             getenv("API_KEY"),
 		AllowedEndpointURL: getenv("ALLOWED_ENDPOINT_URL"),
 	}
+	limit, err := strconv.ParseInt(value("MAX_PENDING_DELIVERIES", "10000"), 10, 64)
+	if err != nil || limit < 1 {
+		return Config{}, fmt.Errorf("MAX_PENDING_DELIVERIES must be a positive integer")
+	}
+	cfg.MaxPendingDeliveries = limit
 	if cfg.MySQLPassword == "" {
 		return Config{}, fmt.Errorf("MYSQL_PASSWORD is required; export the variables in .env first")
 	}

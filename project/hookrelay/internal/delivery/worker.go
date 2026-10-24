@@ -16,7 +16,7 @@ import (
 
 type Repository interface {
 	Claim(context.Context, uint64, uint32, uint32, time.Duration) (*store.DeliveryWork, error)
-	Finish(context.Context, *store.DeliveryWork, string, int, string) error
+	Finish(context.Context, *store.DeliveryWork, string, int, string, time.Duration) error
 }
 
 type Worker struct {
@@ -50,8 +50,13 @@ func (w Worker) ProcessTask(ctx context.Context, t *asynq.Task) error {
 		})
 		if sendErr != nil {
 			reason = "network_error"
-			if result.HTTPStatus != 0 {
+			switch {
+			case result.HTTPStatus != 0:
 				reason = "http_error"
+			case errors.Is(sendErr, context.DeadlineExceeded):
+				reason = "timeout"
+			case errors.Is(sendErr, context.Canceled):
+				reason = "canceled"
 			}
 		}
 	}
@@ -65,7 +70,7 @@ func (w Worker) ProcessTask(ctx context.Context, t *asynq.Task) error {
 		}
 	}
 	// Do not record raw HTTP errors: they can contain URLs or credentials.
-	if err := w.Store.Finish(ctx, work, status, result.HTTPStatus, reason); err != nil {
+	if err := w.Store.Finish(ctx, work, status, result.HTTPStatus, reason, result.Latency); err != nil {
 		return errors.New("save delivery result failed")
 	}
 	slog.Info("delivery attempt", "event_id", work.Event.ID, "delivery_id", work.Delivery.ID,

@@ -62,10 +62,13 @@ func run(ctx context.Context) error {
 			return store.SetEndpointEnabled(ctx, db, id, enabled)
 		},
 		func(ctx context.Context, input store.EventInput) (store.EventResult, error) {
-			return store.CreateOrGetEventDelivery(ctx, db, input)
+			return store.CreateOrGetEventDelivery(ctx, db, input, cfg.MaxPendingDeliveries)
 		},
 		func(ctx context.Context, id uint64) (store.Delivery, error) {
 			return store.FindDelivery(ctx, db, id)
+		},
+		func(ctx context.Context, id, after uint64, limit int) ([]store.DeliveryAttempt, error) {
+			return store.ListDeliveryAttempts(ctx, db, id, after, limit)
 		},
 	)
 	if err := router.SetTrustedProxies(nil); err != nil {

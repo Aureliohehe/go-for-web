@@ -16,6 +16,7 @@ type testRepository struct {
 	claimErr, finishErr error
 	status, reason      string
 	httpStatus          int
+	latency             time.Duration
 	claims, finishes    int
 }
 
@@ -23,8 +24,9 @@ func (r *testRepository) Claim(_ context.Context, id uint64, gen uint32, max uin
 	r.claims++
 	return r.work, r.claimErr
 }
-func (r *testRepository) Finish(_ context.Context, work *store.DeliveryWork, status string, httpStatus int, reason string) error {
+func (r *testRepository) Finish(_ context.Context, work *store.DeliveryWork, status string, httpStatus int, reason string, latency time.Duration) error {
 	r.finishes++
+	r.latency = latency
 	r.status, r.reason, r.httpStatus = status, reason, httpStatus
 	return r.finishErr
 }
@@ -41,6 +43,7 @@ func TestWorker(t *testing.T) {
 		{name: "success", status: "succeeded", code: 204, attempt: 1},
 		{name: "temporary error", status: "retrying", code: 500, retryable: true, sendErr: ErrHTTPStatus, attempt: 1, wantErr: true},
 		{name: "timeout", status: "retrying", retryable: true, sendErr: context.DeadlineExceeded, attempt: 1, wantErr: true},
+		{name: "canceled", status: "retrying", retryable: true, sendErr: context.Canceled, attempt: 1, wantErr: true},
 		{name: "permanent error", status: "failed", code: 400, sendErr: ErrHTTPStatus, attempt: 1, wantErr: true, skipRetry: true},
 		{name: "budget exhausted", status: "failed", code: 500, retryable: true, sendErr: ErrHTTPStatus, attempt: task.MaxAttempts, wantErr: true, skipRetry: true},
 		{name: "terminal skips send", terminal: true},
@@ -63,7 +66,7 @@ func TestWorker(t *testing.T) {
 				if req.DeliveryID != "9" || req.URL != "http://receiver/webhook" || string(req.Payload) != `{ "id": 1 }` {
 					t.Fatal("wrong sender input")
 				}
-				return Result{HTTPStatus: tt.code, Retryable: tt.retryable}, tt.sendErr
+				return Result{HTTPStatus: tt.code, Retryable: tt.retryable, Latency: 12 * time.Millisecond}, tt.sendErr
 			}}
 			if tt.disallowed {
 				worker.AllowedURL = "http://other/webhook"
@@ -75,6 +78,15 @@ func TestWorker(t *testing.T) {
 			wantSends := 1
 			if tt.terminal || tt.claimErr != nil || tt.disallowed {
 				wantSends = 0
+			}
+			if sends == 1 && repo.latency != 12*time.Millisecond {
+				t.Fatal("sender latency not passed to history")
+			}
+			if tt.name == "canceled" && repo.reason != "canceled" {
+				t.Fatal("cancellation must be classified")
+			}
+			if tt.name == "timeout" && repo.reason != "timeout" {
+				t.Fatal("timeout must be classified")
 			}
 			if sends != wantSends {
 				t.Fatalf("sends=%d want=%d", sends, wantSends)

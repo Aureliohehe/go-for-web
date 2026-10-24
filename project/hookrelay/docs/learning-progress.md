@@ -1,7 +1,7 @@
 # 学习进度与下次起点
 
 > 已完成接收端创建→查询及 PATCH 启用/禁用的真实 HTTP + MySQL 验证（用户反馈通过）。
-> 当前已接入三表事务 Outbox + 独立 Dispatcher，验证了 Redis 不可用时接收事件、恢复后自动投递。新迁移 `000003` 尚未应用到用户数据库；下一步补积压背压，再做投递历史与重放。
+> 当前已实现 Outbox、背压和投递尝试历史/分页查询。用户已应用 000001..000004，勿重复执行；新迁移 `000005` 仅在隔离测试库验证，用户库尚未应用。下一步是失败重放。
 
 ## 辅导方式与协作约定
 
@@ -188,7 +188,7 @@ git diff --check
 - 另构建并启动 API、Worker、Receiver 三个进程，真实 HTTP 验证首次 202、重复 200、最终 succeeded/attempt_count=1、同键改内容 409。测试结束已停止本轮创建的临时进程；没有读取用户 `.env`、操作已有数据库或用户服务。Compose Redis 路径及 Worker 强杀恢复尚未验证。
 - **下一步：Outbox + Dispatcher**，替换 API 的直接入队，解决保存成功后未入队的窗口。Redis 丢数据、数据库写回长期失败导致非终态遗留仍需后续对账；不能宣称已可靠投递。第一版仅运行单 Worker，尚未做多实例故障测试。
 
-## 最新进度：Outbox + Dispatcher
+## 此前进度：Outbox + Dispatcher
 
 - 用户已提交上一轮异步闭环；本轮从干净工作区继续，未自动提交。
 - 新增 `migrations/000003_create_outbox.up.sql`：Outbox、轮次唯一约束、扫描索引，并为已有非终态投递回填记录。**仅在隔离测试库应用过，用户数据库待手动迁移**；升级前停止旧 API/Worker，勿重复执行旧迁移；DDL/回填非原子，失败先检查。
@@ -202,6 +202,38 @@ git diff --check
 - Outbox 集成测试新增显式开关 `HOOKRELAY_OUTBOX_INTEGRATION=1`，**必须独立测试数据库且 Outbox 为空，无业务进程运行**（扫描器会全局领取）；不要在日常开发库上运行或清空业务表。普通存储层集成测试仍使用原开关。
 - 未读取 `.env`、未操作用户已有服务。临时进程和独立 Redis 容器已停止/移除；临时测试日志位于 `/tmp/hookrelay-outbox7-TRMJW8`。未执行项目 Compose 启动路径。
 - 当前不包含积压背压、Outbox 清理、已发布后 Redis 丢数据对账或接收方幂等；重复发布只验证已成功投递跳过，不宣称外部副作用恰好一次。多 Dispatcher 仍未做故障验证。
+
+## 此前进度：积压容量与背压
+
+- 用户已提交上一轮 Outbox；本轮从干净工作区继续，无自动提交。
+- 新增 `000004_create_admission_lock.up.sql`：一行数据库接入锁，不维护容量计数器。用户先反馈 hookrelay 仅有 endpoints/events/deliveries，随后按指导导入 `000003` 和 `000004` 并反馈完成；之后助手受托只读确认两张新表和锁行 id=1，不要重复导入。
+- `MAX_PENDING_DELIVERIES` 默认 10000，正整数，所有 API 实例保持一致。上限统计 pending/processing/retrying 的投递总数，而非 Outbox 数量；仅发布到 Redis 不释放容量，成功/最终失败才释放。
+- `internal/store/admission.go` + `event.go`：新事件事务先锁接入行，锁后重查幂等，检查端点与当前积压，最后三表同事务保存。事务采用 READ COMMITTED；序列化容量检查和新投递写入，避免并发超额。幂等重试不占新名额，失败回滚不泄漏容量。
+- Handler 满载返回 `503`、`Retry-After: 5`、`{"error":"backlog_full","persisted":false}`。这是明确未创建记录的拒绝，与此前已移除的“保存后入队失败”503 语义不同。
+- **实际测试通过**：单测/vet/全包 race；临时 MySQL 8.0.42 的容量测试连续 3 次通过，覆盖跨连接池/端点最后一格竞争、相同键并发、满载冲突、processing/retrying 计数、终态释放以及第三次写入失败回滚；Outbox/Redis 7.4 集成测试回归通过。
+- 另启动两个独立 API 进程，配置上限 1，8 个不同键并发请求得到 1 个 202、7 个 503；SQL 确认仅一组三表记录，同键重试 200、冲突 409；测试库中模拟终态后，原先拒绝的键返回 202。未读取 `.env`、未改用户数据库/已有服务，临时进程和 Redis 容器已清理。日志 `/tmp/hookrelay-admission-r7XKyi`。
+- 新增 `HOOKRELAY_ADMISSION_INTEGRATION=1`：仅在已迁移的独立空测试库、无其他业务进程时运行容量集成测试，不得清空业务表满足条件。
+- 代价与边界：新事件接入串行化并逐次计数，尚未压测；上限不限制历史数据总量。未来 failed→pending 的重放必须走同一接入锁/容量检查。下一步实现投递尝试历史，再接失败重放。
+
+## 用户委托的完整背压验证（已通过）
+
+- 只读查询用户 Compose MySQL：数据库 hookrelay，outbox/admission_locks 存在，锁行 id=1，查询时 unfinished=0；没有修改用户业务数据或启停用户进程。
+- 新建隔离 MySQL/Redis 7.4，运行单测、vet、真实存储/队列 race 测试；容量集成测试连续三次通过。
+- 两个独立 API、容量 1、8 个并发不同键：1 个 202、7 个 503 + Retry-After:5 + persisted:false；SQL 确认仅一组三表记录。满载同键重试 200、内容冲突 409、readyz 仍为 200。
+- 随后启动真实 Receiver/Worker/Dispatcher，第一条投递 succeeded、attempt_count=1；原先拒绝的键无需修改即返回 202，随后也 succeeded。**本次不是直接修改 SQL 状态模拟释放容量。**
+- 临时进程与专用 Redis 容器已清理，日志 `/tmp/hookrelay-backpressure-e2e-7QC19h`；生产代码无新增修改。下一步进入投递尝试历史与失败重放。
+
+## 最新进度：投递尝试历史
+
+- 本轮沿用未提交的背压代码，未覆盖/清理用户改动，也未自动提交。
+- 新增 `000005_create_delivery_attempts.up.sql`：delivery_id/generation/attempt_number 唯一，按 delivery_id/id 建分页索引；只记录新执行，不补造已有次数对应的历史。**仅在隔离测试库执行，用户侧未应用。** 升级先停止旧 Worker，再应用新表并启动新版 API/Worker。
+- `internal/store/delivery_work.go`：Claim 在原领取事务中登记 processing 尝试；Finish 在同一事务回写投递和尝试，保存 finished_at/http_status/error_class/latency_ms。已完成历史不变；晚到结果可补全自己的未完成历史，但不能覆盖新 generation/attempt_count 的投递状态。
+- `internal/store/delivery_attempt.go` + `internal/handler/delivery_attempts.go`：`GET /v1/deliveries/:id/attempts?limit=20&after=0`，需 API Key，默认 20 条、最多 100；响应 items 和 next_after（空字符串表示当前无下一页），IDs 用字符串。不存在投递 404，未执行过为空数组。
+- `internal/delivery/worker.go` 传递 Sender 耗时并区分 http_error、network_error、timeout、canceled；不保存原始 URL/payload/错误详情。URL 不允许的领取保留失败历史，但无 Sender 耗时。
+- 边界：历史登记发生在 HTTP 前，因此不是远端精确接收次数；finished_at=null 只表示结果未保存，不能推断未发送。领取前因禁用/预算耗尽而跳过，不伪造尝试；领取后崩溃的记录保留未完成状态。
+- **实际验证通过**：go test/vet/全包 race；临时 MySQL 8.0.42 + Redis 7.4 下登记失败回滚领取、结果历史缺失回滚状态、重复结果不改旧历史、晚到结果隔离、未知结果保留、分页、背压与 Outbox 回归。历史存储测试连续 3 次通过；真实队列测试增加经本地 HTTP API 查询分页的断言。
+- 临时服务已清理，测试日志 `/tmp/hookrelay-history-cU2d99`。未读取 `.env`、未执行用户数据库迁移、未操作已有服务。
+- 下一步失败重放：容量接入锁→只允许 failed→generation+1→重置本轮预算→新 Outbox 同事务，保持 delivery_id，不删除历史。
 
 ## 下次恢复环境
 
@@ -222,8 +254,9 @@ if [ -z "${API_KEY:-}" ]; then
 fi
 export ALLOWED_ENDPOINT_URL="${ALLOWED_ENDPOINT_URL:-http://127.0.0.1:9090/webhook}"
 export REDIS_ADDR="${REDIS_ADDR:-127.0.0.1:16379}"
+export MAX_PENDING_DELIVERIES="${MAX_PENDING_DELIVERIES:-10000}"
 
-# 首次升级先按 README 应用 000003，再运行新版进程。
+# 000001..000004 已完成；首次升级先按 README 应用新迁移 000005。
 go run ./cmd/api
 # 另外三个终端（Worker/Dispatcher 也需加载上述环境）：
 # go run ./cmd/dispatcher

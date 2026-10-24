@@ -25,6 +25,7 @@ func TestPostEvent(t *testing.T) {
 		wantError string
 		wantCalls int
 	}{
+		{name: "backlog full", body: body, storeErr: fmt.Errorf("wrapped: %w", store.ErrBacklogFull), wantCode: 503, wantCalls: 1, wantError: "backlog_full"},
 		{name: "accepted", body: body, wantCode: 202, wantCalls: 1},
 		{name: "reused", body: body, reused: true, wantCode: 200, wantCalls: 1},
 		{name: "unauthorized", body: body, unauthed: true, wantCode: 401, wantError: "unauthorized"},
@@ -51,7 +52,7 @@ func TestPostEvent(t *testing.T) {
 						t.Fatalf("incorrect event input or context: %+v", input)
 					}
 					return store.EventResult{EventID: ^uint64(0), DeliveryID: 9, Reused: tt.reused}, tt.storeErr
-				}, nil)
+				}, nil, nil)
 			request := httptest.NewRequest(http.MethodPost, "/v1/events", strings.NewReader(tt.body)).WithContext(ctx)
 			request.Header.Set("Content-Type", "application/json")
 			request.Header.Set("Idempotency-Key", "order-42")
@@ -66,6 +67,15 @@ func TestPostEvent(t *testing.T) {
 			var got map[string]any
 			if err := json.Unmarshal(response.Body.Bytes(), &got); err != nil {
 				t.Fatal(err)
+			}
+			if tt.wantCode == 503 {
+				if len(got) != 2 || got["error"] != "backlog_full" || got["persisted"] != false || response.Header().Get("Retry-After") != "5" {
+					t.Fatalf("unexpected backpressure response: %v", got)
+				}
+				return
+			}
+			if response.Header().Get("Retry-After") != "" {
+				t.Fatal("only capacity rejection should set Retry-After")
 			}
 			if tt.wantError != "" {
 				if len(got) != 1 || got["error"] != tt.wantError {

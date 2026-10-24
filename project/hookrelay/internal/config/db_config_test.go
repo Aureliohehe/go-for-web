@@ -17,6 +17,7 @@ func TestLoadDBConfigMissingPassword(t *testing.T) {
 }
 
 func TestLoadDBConfigSuccess(t *testing.T) {
+	t.Setenv("MAX_PENDING_DELIVERIES", "10000")
 	t.Setenv("REDIS_ADDR", "127.0.0.1:16379")
 	t.Setenv("HTTP_ADDR", "")
 	t.Setenv("MYSQL_HOST", "127.0.0.1")
@@ -33,14 +34,15 @@ func TestLoadDBConfigSuccess(t *testing.T) {
 	}
 
 	want := config.Config{
-		HTTPAddr:      "127.0.0.1:8080",
-		MySQLHost:     "127.0.0.1",
-		MySQLPort:     "13306",
-		RedisAddr:     "127.0.0.1:16379",
-		MySQLUser:     "test_user",
-		MySQLPassword: "test_password",
-		MySQLDatabase: "test_db",
-		APIKey:        "test-key",
+		HTTPAddr:             "127.0.0.1:8080",
+		MySQLHost:            "127.0.0.1",
+		MySQLPort:            "13306",
+		RedisAddr:            "127.0.0.1:16379",
+		MySQLUser:            "test_user",
+		MySQLPassword:        "test_password",
+		MySQLDatabase:        "test_db",
+		APIKey:               "test-key",
+		MaxPendingDeliveries: 10000,
 	}
 	if cfg != want {
 		t.Fatal("读取到的配置与预期不一致")
@@ -48,6 +50,7 @@ func TestLoadDBConfigSuccess(t *testing.T) {
 }
 
 func TestLoadDBConfigDefaults(t *testing.T) {
+	t.Setenv("MAX_PENDING_DELIVERIES", "")
 	t.Setenv("REDIS_ADDR", "")
 	t.Setenv("HTTP_ADDR", "")
 	t.Setenv("MYSQL_HOST", "")
@@ -62,13 +65,14 @@ func TestLoadDBConfigDefaults(t *testing.T) {
 		t.Fatalf("配置完整时不应报错：%v", err)
 	}
 	want := config.Config{
-		HTTPAddr:      "127.0.0.1:8080",
-		MySQLHost:     "127.0.0.1",
-		MySQLPort:     "13306",
-		RedisAddr:     "127.0.0.1:16379",
-		MySQLUser:     "hookrelay",
-		MySQLPassword: "test_password",
-		MySQLDatabase: "hookrelay",
+		HTTPAddr:             "127.0.0.1:8080",
+		MySQLHost:            "127.0.0.1",
+		MySQLPort:            "13306",
+		RedisAddr:            "127.0.0.1:16379",
+		MySQLUser:            "hookrelay",
+		MySQLPassword:        "test_password",
+		MySQLDatabase:        "hookrelay",
+		MaxPendingDeliveries: 10000,
 	}
 	if cfg != want {
 		t.Fatal("读取到的配置与预期不一致")
