@@ -55,8 +55,8 @@ var (
 	errDuplicateEventKey   = errors.New("duplicate event key")
 )
 
-// CreateOrGetEventDelivery persists an event and its pending delivery together.
-// No queue task or webhook is created here. A repeated key returns the original
+// CreateOrGetEventDelivery persists an event, pending delivery and outbox together.
+// No Redis task or webhook is created here. A repeated key returns the original
 // IDs only when endpoint, event type and raw payload bytes are unchanged.
 // Pass a pool-backed db, not a long-lived outer transaction: after a unique
 
@@ -64,12 +64,15 @@ var (
 func CreateOrGetEventDelivery(ctx context.Context, db *gorm.DB, input EventInput) (EventResult, error) {
 	return createOrGetEventDelivery(ctx, db, input, func(tx *gorm.DB, delivery *Delivery) error {
 		return tx.Create(delivery).Error
+	}, func(tx *gorm.DB, entry *Outbox) error {
+		return tx.Create(entry).Error
 	})
 }
 
-// The insertion seam lets a test fail the second write without altering schema.
+// Insertion seams allow rollback tests without altering shared schema.
 func createOrGetEventDelivery(ctx context.Context, db *gorm.DB, input EventInput,
 	insertDelivery func(*gorm.DB, *Delivery) error,
+	insertOutbox func(*gorm.DB, *Outbox) error,
 ) (EventResult, error) {
 	if err := validateEventInput(input); err != nil {
 		return EventResult{}, err
@@ -117,6 +120,13 @@ func createOrGetEventDelivery(ctx context.Context, db *gorm.DB, input EventInput
 		}
 		if err := insertDelivery(tx, &delivery); err != nil {
 			return fmt.Errorf("create delivery: %w", err)
+		}
+		entry := Outbox{
+			DeliveryID: delivery.ID, Generation: delivery.Generation, Status: "pending",
+			AvailableAt: now, CreatedAt: now, UpdatedAt: now,
+		}
+		if err := insertOutbox(tx, &entry); err != nil {
+			return fmt.Errorf("create outbox: %w", err)
 		}
 		result = EventResult{EventID: event.ID, DeliveryID: delivery.ID}
 		return nil

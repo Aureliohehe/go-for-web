@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/aurelio/hookrelay/internal/service"
 	"github.com/aurelio/hookrelay/internal/store"
 	"github.com/gin-gonic/gin"
 )
@@ -39,14 +38,6 @@ func PostEvent(create EventCreator) gin.HandlerFunc {
 			IdempotencyKey: c.GetHeader("Idempotency-Key"),
 			EndpointID:     endpointID, EventType: input.EventType, Payload: input.Payload,
 		})
-		if errors.Is(err, service.ErrEnqueue) {
-			c.JSON(http.StatusServiceUnavailable, gin.H{
-				"error": "event_saved_queue_unavailable", "persisted": true,
-				"event_id":    strconv.FormatUint(result.EventID, 10),
-				"delivery_id": strconv.FormatUint(result.DeliveryID, 10),
-			})
-			return
-		}
 		if err != nil {
 			status, code := http.StatusInternalServerError, "internal_error"
 			switch {

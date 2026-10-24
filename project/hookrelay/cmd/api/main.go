@@ -13,9 +13,7 @@ import (
 
 	"github.com/aurelio/hookrelay/internal/config"
 	"github.com/aurelio/hookrelay/internal/handler"
-	"github.com/aurelio/hookrelay/internal/service"
 	"github.com/aurelio/hookrelay/internal/store"
-	"github.com/aurelio/hookrelay/internal/task"
 	"github.com/gin-gonic/gin"
 )
 
@@ -48,14 +46,6 @@ func run(ctx context.Context) error {
 	}
 	defer pool.Close()
 	slog.Info("mysql connected")
-	queue := task.NewClient(cfg.RedisAddr)
-	defer queue.Close()
-	events := service.Events{
-		Create: func(ctx context.Context, input store.EventInput) (store.EventResult, error) {
-			return store.CreateOrGetEventDelivery(ctx, db, input)
-		},
-		Enqueue: queue.EnqueueDelivery,
-	}
 
 	gin.SetMode(gin.ReleaseMode)
 	router := handler.NewAPIRouter(
@@ -71,7 +61,9 @@ func run(ctx context.Context) error {
 		func(ctx context.Context, id uint64, enabled bool) (store.Endpoint, error) {
 			return store.SetEndpointEnabled(ctx, db, id, enabled)
 		},
-		events.Accept,
+		func(ctx context.Context, input store.EventInput) (store.EventResult, error) {
+			return store.CreateOrGetEventDelivery(ctx, db, input)
+		},
 		func(ctx context.Context, id uint64) (store.Delivery, error) {
 			return store.FindDelivery(ctx, db, id)
 		},

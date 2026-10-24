@@ -1,7 +1,7 @@
 # 学习进度与下次起点
 
 > 已完成接收端创建→查询及 PATCH 启用/禁用的真实 HTTP + MySQL 验证（用户反馈通过）。
-> 当前已打通 Redis/Asynq 异步投递、有限重试及状态回写；助手已在隔离临时 MySQL/Redis 上通过真实数据库与队列测试。下一步是 Outbox，当前仍有落库后入队前的故障窗口。
+> 当前已接入三表事务 Outbox + 独立 Dispatcher，验证了 Redis 不可用时接收事件、恢复后自动投递。新迁移 `000003` 尚未应用到用户数据库；下一步补积压背压，再做投递历史与重放。
 
 ## 辅导方式与协作约定
 
@@ -176,7 +176,7 @@ git diff --check
 - `go test ./...`、`go vet ./...`、`go test -race ./internal/handler ./internal/delivery` 通过。未读取 `.env`、未执行迁移、未启动/停止用户服务。
 - **下一步：Redis/Asynq + 独立 Worker，接通已保存事件到 Sender 的异步链路。** 先明确直接入队存在故障窗口，随后接 Outbox。当前查询到的投递仍保持 pending，不能宣称已有自动投递。
 
-## 最新进度：Asynq 异步闭环
+## 此前进度：Asynq 异步闭环
 
 - 增加 Asynq v0.25.1、`REDIS_ADDR`（默认 `127.0.0.1:16379`）与 Compose Redis 7.4/AOF 配置；本轮无新 SQL 迁移。
 - `internal/service/event.go`：先复用存储层事务，再入队；幂等重试也尝试补入队。失败返回 503 + `persisted=true` + 原 ID，禁止误导为“没有保存”。稳定 TaskID 冲突视为已入队。
@@ -187,6 +187,21 @@ git diff --check
 - **助手实际验证**：`go test ./...`、`go vet ./...`、相关包 race 测试；独立临时 MySQL 8.0.42 和 Redis 上执行 `HOOKRELAY_INTEGRATION=1 go test -count=1 -race ./internal/store ./cmd/api ./tests/integration` 通过（含事件事务回滚、并发幂等、租约/执行令牌及真实队列成功/500后成功/400失败/503耗尽预算）。
 - 另构建并启动 API、Worker、Receiver 三个进程，真实 HTTP 验证首次 202、重复 200、最终 succeeded/attempt_count=1、同键改内容 409。测试结束已停止本轮创建的临时进程；没有读取用户 `.env`、操作已有数据库或用户服务。Compose Redis 路径及 Worker 强杀恢复尚未验证。
 - **下一步：Outbox + Dispatcher**，替换 API 的直接入队，解决保存成功后未入队的窗口。Redis 丢数据、数据库写回长期失败导致非终态遗留仍需后续对账；不能宣称已可靠投递。第一版仅运行单 Worker，尚未做多实例故障测试。
+
+## 最新进度：Outbox + Dispatcher
+
+- 用户已提交上一轮异步闭环；本轮从干净工作区继续，未自动提交。
+- 新增 `migrations/000003_create_outbox.up.sql`：Outbox、轮次唯一约束、扫描索引，并为已有非终态投递回填记录。**仅在隔离测试库应用过，用户数据库待手动迁移**；升级前停止旧 API/Worker，勿重复执行旧迁移；DDL/回填非原子，失败先检查。
+- `internal/store/event.go`：events、deliveries、outbox 同事务写入；幂等命中不新增 Outbox，新增测试验证第三次写入失败时前两次回滚，以及并发重复只有一条 Outbox。
+- 新增 `internal/store/outbox.go`：短事务领取、过期租约恢复、条件发布/重试。available_at 统一表示重试时间或 processing 租约到期；publish_attempts 作为令牌防止旧发布者回写。
+- 新增 `internal/outbox/dispatcher.go`、`cmd/dispatcher`：独立单 Dispatcher 发布，租约 30s、Redis 超时 5s，空闲轮询 1s，入队失败退避 5/10/20/40/60s；入队成功但标记失败保留租约，后续允许重复发布。
+- `internal/task/delivery.go` 改为接收真实 generation，稳定 TaskID 为 delivery-ID-generation。API 已去掉 Redis 客户端，删去不再需要的 `internal/service/event.go` 和旧测试；去掉“已保存但队列失败”503。现在 202 只表示三表事务已提交。
+- **本轮实际验证**：单测、vet、race；临时 MySQL 8.0.42 + 独立 Docker Redis 7.4 下，三表事务、回填旧非终态投递、重试/归档、租约失效后新 Dispatcher 恢复、旧令牌不能覆盖、入队成功但确认失败导致真正重复入队均通过。
+- 四进程演示通过：Redis 未运行时 API 首次 202/重复 200，Dispatcher 记录失败并退避；Redis 恢复后自动发布、Worker succeeded，客户端没有再次提交。
+- 测试中发现宿主 Redis 5 不支持 Asynq 归档 Lua 所需命令；此前仅检查数据库 failed 不足以证明队列归档成功。已增加队列终态断言，改用 Redis 7.4 重跑通过。不要使用宿主旧 Redis 5。
+- Outbox 集成测试新增显式开关 `HOOKRELAY_OUTBOX_INTEGRATION=1`，**必须独立测试数据库且 Outbox 为空，无业务进程运行**（扫描器会全局领取）；不要在日常开发库上运行或清空业务表。普通存储层集成测试仍使用原开关。
+- 未读取 `.env`、未操作用户已有服务。临时进程和独立 Redis 容器已停止/移除；临时测试日志位于 `/tmp/hookrelay-outbox7-TRMJW8`。未执行项目 Compose 启动路径。
+- 当前不包含积压背压、Outbox 清理、已发布后 Redis 丢数据对账或接收方幂等；重复发布只验证已成功投递跳过，不宣称外部副作用恰好一次。多 Dispatcher 仍未做故障验证。
 
 ## 下次恢复环境
 
@@ -208,8 +223,10 @@ fi
 export ALLOWED_ENDPOINT_URL="${ALLOWED_ENDPOINT_URL:-http://127.0.0.1:9090/webhook}"
 export REDIS_ADDR="${REDIS_ADDR:-127.0.0.1:16379}"
 
+# 首次升级先按 README 应用 000003，再运行新版进程。
 go run ./cmd/api
-# 另外两个终端（Worker 也需加载上述环境）：
+# 另外三个终端（Worker/Dispatcher 也需加载上述环境）：
+# go run ./cmd/dispatcher
 # go run ./cmd/worker
 # go run ./cmd/receiver
 ```
@@ -222,7 +239,7 @@ go run ./cmd/api
 - 若执行集成测试，需数据库运行、迁移已应用，且当前终端已导出数据库配置：
 
 ```bash
-HOOKRELAY_INTEGRATION=1 go test -count=1 -v ./internal/store ./cmd/api ./tests/integration
+HOOKRELAY_INTEGRATION=1 go test -count=1 -v ./internal/store ./cmd/api
 ```
 
 ## 收尾与保存边界

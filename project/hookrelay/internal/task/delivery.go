@@ -32,15 +32,15 @@ func NewClient(addr string) *Client {
 
 func (c *Client) Close() error { return c.client.Close() }
 
-// Generation is 1 until manual replay is implemented. Stable task IDs suppress
-// duplicate submissions while a task exists; the database remains authoritative.
-func (c *Client) EnqueueDelivery(ctx context.Context, id uint64) error {
-	payload, err := json.Marshal(Payload{DeliveryID: id, Generation: 1})
+// Stable task IDs suppress duplicate publications while a task exists;
+// the database remains authoritative after a completed task is removed.
+func (c *Client) EnqueueDelivery(ctx context.Context, id uint64, generation uint32) error {
+	payload, err := json.Marshal(Payload{DeliveryID: id, Generation: generation})
 	if err != nil {
 		return err
 	}
 	_, err = c.client.EnqueueContext(ctx, asynq.NewTask(TypeDelivery, payload),
-		asynq.Queue(Queue), asynq.TaskID(fmt.Sprintf("delivery-%d-1", id)),
+		asynq.Queue(Queue), asynq.TaskID(fmt.Sprintf("delivery-%d-%d", id, generation)),
 		asynq.MaxRetry(MaxAttempts-1), asynq.Timeout(TaskTimeout))
 	if errors.Is(err, asynq.ErrTaskIDConflict) {
 		return nil

@@ -4,13 +4,13 @@
 
 目标能力：幂等事件接入、Outbox 可靠入队、异步 HTTP 投递、有限重试、投递历史、失败重放及接收方签名与幂等示例。
 
-> 已打通事件落库 → Redis/Asynq → Worker → HTTP 接收端 → 投递状态更新，支持有限重试。**尚无 Outbox、签名、接收方幂等和自动对账，不是可靠交付完成版，仅供本地受控演示。**
+> 已打通事件/投递/Outbox 同事务 → Dispatcher → Redis/Asynq → Worker → HTTP 投递，支持入队恢复和有限投递重试。**尚无积压背压、签名、接收方幂等和自动对账，仅供本地受控演示。**
 
 ## 学习进度（下次先看这里）
 
 详见 [学习记录与下次起点](docs/learning-progress.md)。
 
-用户已应用 events/deliveries 迁移。助手使用隔离的临时 MySQL 8.0.42 + Redis，通过了事件事务/并发幂等、Worker 状态更新及真实队列成功/临时失败重试/永久失败/耗尽预算测试，并验证了三个独立进程的 API→Worker→接收端链路。没有读取用户 `.env` 或操作已有服务；Compose Redis 启动路径尚未在该验证中执行。
+用户已应用前两份迁移；本轮新增 `000003_create_outbox.up.sql`，**尚未应用到用户数据库**。助手已用隔离 MySQL 8.0.42 + Redis 7.4 验证三表事务回滚、幂等、租约恢复、重复发布和队列归档，并通过四进程 Redis 不可用→恢复后的自动投递演示。未读取用户 `.env` 或操作现有服务。
 
 协作方式：助手写代码、用户理解逻辑；优先核心流程，避免过多防御性代码。
 
@@ -32,15 +32,27 @@ export ALLOWED_ENDPOINT_URL="${ALLOWED_ENDPOINT_URL:-http://127.0.0.1:9090/webho
 # API_KEY 需自行配置；已有的 000001/000002 迁移勿重复执行。
 ```
 
-在三个终端分别运行（API/Worker 终端均需加载上述环境）：
+升级时先停止旧版 API、Worker，再对已有数据库**仅执行一次新迁移**（提示时输入密码，不放入命令行）：
+
+```bash
+env -u MYSQL_HOST -u MYSQL_PORT mysql --protocol=TCP \
+  -h "${MYSQL_HOST:-127.0.0.1}" -P "${MYSQL_PORT:-13306}" \
+  -u "${MYSQL_USER:-hookrelay}" -p "${MYSQL_DATABASE:-hookrelay}" \
+  < migrations/000003_create_outbox.up.sql
+```
+
+迁移会为旧的非终态投递补建 Outbox；DDL 与回填不是一个原子事务，失败后先检查执行进度，不盲目重跑。全新数据库按顺序执行三份迁移。已有迁移勿重复执行。
+
+在四个终端分别运行（API/Worker/Dispatcher 终端均需加载上述环境）：
 
 ```bash
 go run ./cmd/receiver
 go run ./cmd/worker
+go run ./cmd/dispatcher
 go run ./cmd/api
 ```
 
-创建接收端后，按下方示例提交事件并查询投递。模拟故障时，停止并重启**模拟接收端**：`go run ./cmd/receiver -status 500` 或 `go run ./cmd/receiver -delay 8s`，再提交新事件。默认使用 Asynq 退避，重试不是立即发生。只运行一个 Worker；接收端没有持久化去重和验签。
+创建接收端后，按下方示例提交事件并查询投递。模拟故障时，停止并重启**模拟接收端**：`go run ./cmd/receiver -status 500` 或 `go run ./cmd/receiver -delay 8s`，再提交新事件。默认使用 Asynq 退避，重试不是立即发生。只运行一个 Worker 和一个 Dispatcher；接收端没有持久化去重和验签。使用 Compose 的 Redis 7.4，宿主旧 Redis 5 不兼容 Asynq 的归档操作。
 
 ## 接口与测试
 
@@ -52,7 +64,8 @@ go run ./cmd/api
 - `POST /v1/events`：需 `X-API-Key`、`Idempotency-Key` 和 JSON 请求体；首次返回 202，同键同内容返回 200 和原 ID，同键不同内容返回 409。HTTP 投递由独立 Worker 异步执行。
 - `GET /v1/deliveries/:id`：需 `X-API-Key`，返回投递 ID、事件 ID、状态、执行版本、尝试次数、最后 HTTP 状态/错误分类及创建/更新时间；不存在返回 404。
 - `go test ./...`：运行不依赖数据库的测试（包括 Sender 的本地 HTTP 测试），集成测试默认跳过。
-- `HOOKRELAY_INTEGRATION=1 go test -count=1 -v ./internal/store ./cmd/api ./tests/integration`：需 MySQL、Redis 及两份已应用迁移；覆盖事务、并发幂等、领取/条件回写、真实队列重试等。端点接口测试回滚，跨事务测试只清理自身记录；异步测试使用独立随机队列，结束时删除自己的队列。
+- `HOOKRELAY_INTEGRATION=1 go test -count=1 -v ./internal/store ./cmd/api`：需 MySQL 和三份已应用迁移，覆盖事务、并发幂等、领取/条件回写；测试回滚或只清理自身记录。
+- `HOOKRELAY_OUTBOX_INTEGRATION=1 go test -count=1 -race -v ./tests/integration`：**仅对已迁移的独立测试数据库运行，Outbox 必须为空，不能有 API/Dispatcher/Worker 同时运行**。需 Redis 7.4；测试使用独立随机队列。覆盖成功/重试/归档、Redis 连接失败后恢复、领取后失联、入队后确认失败及旧执行令牌。不要指向日常开发数据库，也不要为了通过检查清空业务表。
 
 用户已确认 Docker 工具及引擎可用，并完成 Compose 启动 MySQL、数据库停止与恢复的手动验证。`docs/day-01.md` 保留的是初始实现时的操作指南与验证记录，最新学习状态以学习进度文档为准。
 
@@ -84,8 +97,8 @@ curl -i http://127.0.0.1:8080/v1/events \
 - 幂等键为 1～128 字节可打印 ASCII，不含空格；事件类型为 1～128 字节，payload 必填，为任意 JSON 值，最多 256 KiB。
 - 摘要比较端点 ID、事件类型和 payload 原始字节；payload 内部空白变化也会冲突。不要在重试时重新格式化 payload。
 - 新事件端点不存在返回 404，禁用返回 409；已接受事件的同内容重试不受后来禁用影响。
-- 202 表示已持久化且本次入队成功（或任务已存在），不表示接收方已处理成功。
-- Redis 入队失败返回 `503`、`error=event_saved_queue_unavailable`、`persisted=true` 及两个 ID。**此时数据已经保存**，使用原幂等键和原内容重试可补入队，不要换新键。
+- 202 表示事件、投递和 Outbox 已在同一事务中提交；不表示已入队或已投递。
+- API 不再访问 Redis。Redis 不可用时仍返回 202，Dispatcher 会后台重试，无需客户端重新提交。旧版 `event_saved_queue_unavailable` 503 响应已移除。
 
 ## 查询投递
 
@@ -97,15 +110,34 @@ curl -i http://127.0.0.1:8080/v1/deliveries/1 -H "X-API-Key: $API_KEY"
 
 `internal/delivery/sender.go` 已实现单次 HTTP POST：原样发送 payload，携带稳定 `X-Webhook-ID`；2xx 成功，网络错误/超时/408/429/5xx 标记可重试，3xx 不跟随且视为永久失败，其余 4xx 不重试。Sender 使用调用方指定的 HTTP 超时，传递 context，最多读取 4 KiB 响应体以便连接复用。它不负责排队、自动重试或写数据库，也尚未实现 HMAC、Retry-After，仅供受控本地测试。
 
+## Outbox 发布流程
+
+```text
+API ──MySQL 事务──► events + deliveries + outbox
+                                            │
+                                      Dispatcher
+                                            │
+                                       Redis/Asynq
+                                            │
+                                          Worker → HTTP
+```
+
+Outbox 状态：`pending → processing → published`。领取用短事务和 30 秒租约，事务提交后才请求 Redis；入队失败回到 pending，按 5/10/20/40/60 秒退避。Redis 超时 5 秒，空闲每秒扫描一次。
+
+`available_at` 在 pending 时表示下次重试时间，在 processing 时表示租约到期时间。Dispatcher 重启可重新领取过期记录；`publish_attempts` 是领取令牌，阻止旧发布者覆盖新状态。
+
+入队成功但标记失败时允许重复发布，任务仍使用稳定 delivery_id/generation；已成功投递会由 Worker 跳过。**published 只表示入队已确认，不表示投递成功。** 这不是接收方业务的恰好一次保证。
+
 ## Worker 与当前限制
 
 - 任务类型 `webhook:deliver`，队列 `webhooks`，payload 仅含 delivery_id 与 generation。稳定任务 ID 抑制队列内重复；已终态或旧 generation 由数据库跳过。
 - 当前默认：单进程、并发 1，最多 3 次领取，HTTP 超时 5 秒、任务超时 20 秒、执行租约 30 秒。参数集中于 `internal/task/delivery.go`；Asynq 负责退避，数据库负责状态与预算。
 - 领取使用短事务；发送不持有事务；回写校验 generation 和 attempt_count。租约过期仍可能重复发送，不能保证外部业务恰好一次。
-- **仍有落库后、入队前崩溃窗口**。重复提交只能人工补救，未接 Outbox 不承诺自动恢复。
+- 已保存但未入队的记录由 Outbox 恢复。**已 published 后 Redis 丢失任务不在该恢复范围内**，仍需 Reconciler。
+- 目前未实现积压上限/背压和 Outbox 历史清理，Redis 长时间不可用会持续积压，不适合无限接收。
 - Redis 数据丢失、任务因数据库长期故障耗尽重试、最终结果无法写库，可能遗留非终态记录；没有 Reconciler。Worker 强杀恢复时间、多实例并发尚未做故障验证。
 - 暂无投递历史、人工重放、HMAC、接收端幂等、Retry-After 和全局端点隔离。签名密钥目前仅保存，不参与发送。
 
 ## 下一步
 
-实现 Outbox：将事件、投递和待入队记录放进同一事务，由 Dispatcher 持续发布，替换 API 中的直接入队。
+先补积压上限与背压，再增加投递尝试历史和失败重放。Redis 丢任务后的自动对账仍是后续任务。

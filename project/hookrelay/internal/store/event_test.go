@@ -34,7 +34,7 @@ func TestCreateOrGetEventDeliveryRejectsInvalidInput(t *testing.T) {
 
 func TestCreateOrGetEventDeliveryIntegration(t *testing.T) {
 	if os.Getenv("HOOKRELAY_INTEGRATION") != "1" {
-		t.Skip("set HOOKRELAY_INTEGRATION=1 after applying migration 000002")
+		t.Skip("set HOOKRELAY_INTEGRATION=1 after applying migrations 000001..000003")
 	}
 	cfg, err := config.Load()
 	if err != nil {
@@ -63,12 +63,31 @@ func TestCreateOrGetEventDeliveryIntegration(t *testing.T) {
 	if _, err := createOrGetEventDelivery(ctx, db, EventInput{
 		IdempotencyKey: rollbackKey, EndpointID: endpoint.ID,
 		EventType: "order.created", Payload: []byte(`{"id":1}`),
-	}, func(*gorm.DB, *Delivery) error { return failedDelivery }); !errors.Is(err, failedDelivery) {
+	}, func(*gorm.DB, *Delivery) error { return failedDelivery }, nil); !errors.Is(err, failedDelivery) {
 		t.Fatal("a failed delivery insert must fail the whole transaction")
 	}
 	var count int64
 	if err := db.Model(&Event{}).Where("idempotency_key = ?", rollbackKey).Count(&count).Error; err != nil || count != 0 {
 		t.Fatal("failed delivery insert must roll back the event")
+	}
+
+	// Fail the third write and verify that both earlier writes roll back.
+	var rolledBackDeliveryID uint64
+	failedOutbox := errors.New("injected outbox write failure")
+	if _, err := createOrGetEventDelivery(ctx, db, EventInput{
+		IdempotencyKey: rollbackKey, EndpointID: endpoint.ID, EventType: "test", Payload: []byte(`{}`),
+	}, func(tx *gorm.DB, d *Delivery) error {
+		err := tx.Create(d).Error
+		rolledBackDeliveryID = d.ID
+		return err
+	}, func(*gorm.DB, *Outbox) error { return failedOutbox }); !errors.Is(err, failedOutbox) {
+		t.Fatal("outbox failure must fail the transaction")
+	}
+	if err := db.Model(&Event{}).Where("idempotency_key = ?", rollbackKey).Count(&count).Error; err != nil || count != 0 {
+		t.Fatal("outbox failure must roll back event")
+	}
+	if err := db.Model(&Delivery{}).Where("id = ?", rolledBackDeliveryID).Count(&count).Error; err != nil || count != 0 {
+		t.Fatal("outbox failure must roll back delivery")
 	}
 
 	input := EventInput{IdempotencyKey: key, EndpointID: endpoint.ID, EventType: "order.created", Payload: []byte(`{"id":1}`)}
@@ -180,6 +199,11 @@ func TestCreateOrGetEventDeliveryIntegration(t *testing.T) {
 	if err := db.Model(&Delivery{}).Where("event_id = ?", results[0].EventID).Count(&count).Error; err != nil || count != 1 {
 		t.Fatal("concurrent duplicates must have only one delivery")
 	}
+	for _, id := range []uint64{first.DeliveryID, result.DeliveryID, results[0].DeliveryID} {
+		if err := db.Model(&Outbox{}).Where("delivery_id = ? AND generation = 1", id).Count(&count).Error; err != nil || count != 1 {
+			t.Fatal("each delivery must have exactly one outbox, including duplicate submissions")
+		}
+	}
 }
 
 func newTestEventKey(t *testing.T) string {
@@ -200,6 +224,9 @@ func cleanupTestEvents(t *testing.T, db *gorm.DB, endpointID uint64, keys []stri
 		return
 	}
 	for _, event := range events {
+		if err := db.Where("delivery_id IN (?)", db.Model(&Delivery{}).Select("id").Where("event_id = ?", event.ID)).Delete(&Outbox{}).Error; err != nil {
+			t.Error("delete test outbox failed")
+		}
 		if err := db.Where("event_id = ?", event.ID).Delete(&Delivery{}).Error; err != nil {
 			t.Error("delete test delivery failed")
 		}

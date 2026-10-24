@@ -10,7 +10,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/aurelio/hookrelay/internal/service"
 	"github.com/aurelio/hookrelay/internal/store"
 )
 
@@ -26,7 +25,6 @@ func TestPostEvent(t *testing.T) {
 		wantError string
 		wantCalls int
 	}{
-		{name: "queue unavailable", body: body, storeErr: service.ErrEnqueue, wantCode: 503, wantCalls: 1, wantError: "event_saved_queue_unavailable"},
 		{name: "accepted", body: body, wantCode: 202, wantCalls: 1},
 		{name: "reused", body: body, reused: true, wantCode: 200, wantCalls: 1},
 		{name: "unauthorized", body: body, unauthed: true, wantCode: 401, wantError: "unauthorized"},
@@ -68,12 +66,6 @@ func TestPostEvent(t *testing.T) {
 			var got map[string]any
 			if err := json.Unmarshal(response.Body.Bytes(), &got); err != nil {
 				t.Fatal(err)
-			}
-			if tt.wantCode == 503 {
-				if len(got) != 4 || got["error"] != tt.wantError || got["persisted"] != true || got["event_id"] != "18446744073709551615" || got["delivery_id"] != "9" {
-					t.Fatalf("unexpected persisted error: %v", got)
-				}
-				return
 			}
 			if tt.wantError != "" {
 				if len(got) != 1 || got["error"] != tt.wantError {
