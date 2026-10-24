@@ -74,7 +74,7 @@ func (w Worker) ProcessTask(ctx context.Context, t *asynq.Task) error {
 		return errors.New("save delivery result failed")
 	}
 	slog.Info("delivery attempt", "event_id", work.Event.ID, "delivery_id", work.Delivery.ID,
-		"attempt", work.Delivery.AttemptCount, "status", status, "http_status", result.HTTPStatus, "latency_ms", result.Latency.Milliseconds())
+		"generation", work.Delivery.Generation, "attempt", work.Delivery.AttemptCount, "status", status, "http_status", result.HTTPStatus, "latency_ms", result.Latency.Milliseconds())
 	if status == "retrying" {
 		return errors.New("delivery temporarily failed")
 	}

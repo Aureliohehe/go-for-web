@@ -9,7 +9,7 @@ import (
 
 // Held until the event transaction commits/rolls back, not during delivery.
 // A database lock (rather than a Go mutex) also serializes separate API processes.
-// Future failed -> pending replay must use this same admission gate.
+// Event creation and failed -> pending replay both use this admission gate.
 func lockAdmission(tx *gorm.DB) error {
 	var row struct{ ID uint8 }
 	if err := tx.Table("admission_locks").Clauses(clause.Locking{Strength: "UPDATE"}).

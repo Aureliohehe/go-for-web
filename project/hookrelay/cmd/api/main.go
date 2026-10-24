@@ -70,6 +70,9 @@ func run(ctx context.Context) error {
 		func(ctx context.Context, id, after uint64, limit int) ([]store.DeliveryAttempt, error) {
 			return store.ListDeliveryAttempts(ctx, db, id, after, limit)
 		},
+		func(ctx context.Context, id uint64) (store.Delivery, error) {
+			return store.ReplayDelivery(ctx, db, id, cfg.MaxPendingDeliveries)
+		},
 	)
 	if err := router.SetTrustedProxies(nil); err != nil {
 		return fmt.Errorf("configure trusted proxies: %w", err)

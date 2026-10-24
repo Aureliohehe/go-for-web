@@ -196,7 +196,45 @@ func TestAdmissionIntegration(t *testing.T) {
 	if !errors.Is(err, injected) {
 		t.Fatal("expected injected rollback")
 	}
-	if result, err := CreateOrGetEventDelivery(ctx, db, failed, 1); err != nil || result.Reused {
+	last, err := CreateOrGetEventDelivery(ctx, db, failed, 1)
+	if err != nil || last.Reused {
 		t.Fatal("rollback must not consume a slot")
+	}
+	// 'next' is failed, while 'last' occupies the only available slot.
+	if _, err := ReplayDelivery(ctx, db, next.DeliveryID, 1); !errors.Is(err, ErrBacklogFull) {
+		t.Fatal("replay must obey capacity")
+	}
+	unchanged, err := FindDelivery(ctx, db, next.DeliveryID)
+	if err != nil || unchanged.Generation != 1 || unchanged.Status != "failed" {
+		t.Fatal("rejected replay changed delivery")
+	}
+	var outboxes int64
+	if err := db.Model(&Outbox{}).Where("delivery_id = ?", next.DeliveryID).Count(&outboxes).Error; err != nil || outboxes != 1 {
+		t.Fatal("rejected replay created outbox")
+	}
+	work, err = repo.Claim(ctx, last.DeliveryID, 1, 3, time.Minute)
+	if err != nil || work == nil {
+		t.Fatal("last claim failed")
+	}
+	if err := repo.Finish(ctx, work, "succeeded", 204, "", time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+
+	// A new event and a replay, on separate pools, share the same gate.
+	newInput := input(endpoint.ID)
+	raceStart := make(chan struct{})
+	var createErr, replayErr error
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); <-raceStart; _, createErr = CreateOrGetEventDelivery(ctx, db, newInput, 1) }()
+	go func() { defer wg.Done(); <-raceStart; _, replayErr = ReplayDelivery(ctx, otherDB, next.DeliveryID, 1) }()
+	close(raceStart)
+	wg.Wait()
+	if !((createErr == nil && errors.Is(replayErr, ErrBacklogFull)) || (replayErr == nil && errors.Is(createErr, ErrBacklogFull))) {
+		t.Fatalf("capacity race: create=%v replay=%v", createErr, replayErr)
+	}
+	var unfinished int64
+	if err := db.Model(&Delivery{}).Where("status IN ?", []string{"pending", "processing", "retrying"}).Count(&unfinished).Error; err != nil || unfinished != 1 {
+		t.Fatal("mixed acceptance exceeded capacity")
 	}
 }

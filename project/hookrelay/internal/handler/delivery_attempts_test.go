@@ -52,7 +52,7 @@ func TestGetDeliveryAttempts(t *testing.T) {
 						t.Fatal("incorrect query or context")
 					}
 					return tt.rows, tt.dbErr
-				})
+				}, nil)
 			request := httptest.NewRequest(http.MethodGet, "/v1/deliveries/"+tt.id+"/attempts"+tt.query, nil).WithContext(ctx)
 			if !tt.unauthed {
 				request.Header.Set("X-API-Key", "key")

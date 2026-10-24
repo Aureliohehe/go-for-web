@@ -4,13 +4,13 @@
 
 目标能力：幂等事件接入、Outbox 可靠入队、异步 HTTP 投递、有限重试、投递历史、失败重放及接收方签名与幂等示例。
 
-> 已打通事件/投递/Outbox 同事务 → Dispatcher → Redis/Asynq → Worker → HTTP 投递，支持入队恢复和有限投递重试。已加入未完成投递容量限制、投递尝试历史及分页查询；**尚无签名、接收方幂等和自动对账，仅供本地受控演示。**
+> 已打通事件/投递/Outbox 同事务 → Dispatcher → Redis/Asynq → Worker → HTTP 投递，支持入队恢复和有限投递重试。已加入未完成投递容量限制、投递尝试历史、分页查询和失败重放；**尚无签名、接收方幂等和自动对账，仅供本地受控演示。**
 
 ## 学习进度（下次先看这里）
 
 详见 [学习记录与下次起点](docs/learning-progress.md)。
 
-用户已完成 `000003`（Outbox）和 `000004`（接入锁），助手已只读确认，**不要重复导入**。本轮新增 `000005_create_delivery_attempts.up.sql`，尚未应用到用户数据库。隔离 MySQL 8.0.42/Redis 7.4 下验证了历史登记/结果回写原子性、崩溃未完成记录、晚到结果隔离及真实 HTTP 分页；既有背压、Outbox、队列测试回归通过。
+用户已完成 `000003`（Outbox）和 `000004`（接入锁），助手已只读确认，**不要重复导入**。`000005_create_delivery_attempts.up.sql` 已由助手按用户授权导入 `hookrelay`，并验证表结构、索引、外键及导入时历史记录为 0；五份迁移均已完成，不要重复执行。本轮失败重放不需要新迁移。隔离 MySQL 8.0.42/Redis 7.4 下已验证并发重放、Outbox 写入失败回滚、重放与新事件共享容量、旧 generation 隔离及真实 HTTP 重放后成功投递；历史保留且投递 ID 不变。
 
 协作方式：助手写代码、用户理解逻辑；优先核心流程，避免过多防御性代码。
 
@@ -30,19 +30,10 @@ set -a; . ./.env; set +a
 export REDIS_ADDR="${REDIS_ADDR:-127.0.0.1:16379}"
 export MAX_PENDING_DELIVERIES="${MAX_PENDING_DELIVERIES:-10000}"
 export ALLOWED_ENDPOINT_URL="${ALLOWED_ENDPOINT_URL:-http://127.0.0.1:9090/webhook}"
-# API_KEY 需自行配置；已有的 000001..000004 迁移勿重复执行。
+# API_KEY 需自行配置；已有的 000001..000005 迁移勿重复执行。
 ```
 
-升级前停止旧版 Worker，避免它继续发送但不记录历史；停止 API 后更新程序。确认前四份迁移已应用，再**仅执行一次新迁移**（提示时输入密码，不放入命令行）：
-
-```bash
-env -u MYSQL_HOST -u MYSQL_PORT mysql --protocol=TCP \
-  -h "${MYSQL_HOST:-127.0.0.1}" -P "${MYSQL_PORT:-13306}" \
-  -u "${MYSQL_USER:-hookrelay}" -p "${MYSQL_DATABASE:-hookrelay}" \
-  < migrations/000005_create_delivery_attempts.up.sql
-```
-
-`000005` 只记录升级后的执行，不补造以前的 HTTP 历史，因此历史条数可能小于已有 attempt_count。全新数据库按顺序执行五份迁移；若较早迁移缺失，先检查状态并按序补齐，已有迁移勿重复执行。
+当前环境五份迁移均已完成，**本轮无需导表，只需更新并重启 API/Worker**。全新数据库才需要按顺序执行五份迁移；不要重复执行已有迁移。`000005` 不补造升级前的历史，所以历史条数可能小于过去的 attempt_count。
 
 在四个终端分别运行（API/Worker/Dispatcher 终端均需加载上述环境）：
 
@@ -65,10 +56,11 @@ go run ./cmd/api
 - `POST /v1/events`：需 `X-API-Key`、`Idempotency-Key` 和 JSON 请求体；首次返回 202，同键同内容返回 200 和原 ID，同键不同内容返回 409。HTTP 投递由独立 Worker 异步执行。
 - `GET /v1/deliveries/:id`：需 `X-API-Key`，返回投递 ID、事件 ID、状态、执行版本、尝试次数、最后 HTTP 状态/错误分类及创建/更新时间；不存在返回 404。
 - `GET /v1/deliveries/:id/attempts?limit=20&after=0`：需 `X-API-Key`，按尝试 ID 升序分页查询历史。
+- `POST /v1/deliveries/:id/replay`：需 `X-API-Key`，仅允许 failed 状态，成功返回 202 和新 generation；不需要请求体。
 - `go test ./...`：运行不依赖数据库的测试（包括 Sender 的本地 HTTP 测试），集成测试默认跳过。
-- `HOOKRELAY_INTEGRATION=1 go test -count=1 -v ./internal/store ./cmd/api`：需 MySQL 和五份已应用迁移，覆盖事务、并发幂等、领取/结果与历史原子写入、游标查询；测试回滚或只清理自身记录。
-- `HOOKRELAY_ADMISSION_INTEGRATION=1 go test -count=1 -race -run TestAdmissionIntegration ./internal/store`：仅对已迁移的独立空测试库运行，无其他业务进程；验证最后一个名额并发竞争、满载幂等、投递终态释放容量及事务回滚。不要清空业务库来满足测试条件。
-- `HOOKRELAY_OUTBOX_INTEGRATION=1 go test -count=1 -race -v ./tests/integration`：**仅对已迁移的独立测试数据库运行，Outbox 必须为空，不能有 API/Dispatcher/Worker 同时运行**。需 Redis 7.4；测试使用独立随机队列。覆盖成功/重试/归档、Redis 连接失败后恢复、领取后失联、入队后确认失败、旧执行令牌及真实 HTTP 历史分页。不要指向日常开发数据库，也不要为了通过检查清空业务表。
+- `HOOKRELAY_INTEGRATION=1 go test -count=1 -v ./internal/store ./cmd/api`：需 MySQL 和五份已应用迁移，覆盖事务、并发幂等、历史原子写入、游标查询、并发重放与旧轮次回写；测试回滚或只清理自身记录。
+- `HOOKRELAY_ADMISSION_INTEGRATION=1 go test -count=1 -race -run TestAdmissionIntegration ./internal/store`：仅对已迁移的独立空测试库运行，无其他业务进程；验证最后一个名额竞争、满载幂等、终态释放、事务回滚，以及新事件与重放争抢同一容量。不要清空业务库来满足测试条件。
+- `HOOKRELAY_OUTBOX_INTEGRATION=1 go test -count=1 -race -v ./tests/integration`：**仅对已迁移的独立测试数据库运行，Outbox 必须为空，不能有 API/Dispatcher/Worker 同时运行**。需 Redis 7.4；测试使用独立随机队列。覆盖成功/重试/归档、Redis 连接失败后恢复、领取后失联、入队后确认失败、旧执行令牌、真实 HTTP 历史分页及失败重放后成功投递。不要指向日常开发数据库，也不要为了通过检查清空业务表。
 
 用户已确认 Docker 工具及引擎可用，并完成 Compose 启动 MySQL、数据库停止与恢复的手动验证。`docs/day-01.md` 保留的是初始实现时的操作指南与验证记录，最新学习状态以学习进度文档为准。
 
@@ -115,7 +107,7 @@ curl -i http://127.0.0.1:8080/v1/events \
 
 这个响应明确表示本次请求没有创建事件、投递或 Outbox，可以保留同一幂等键稍后重试。5 秒只是重试建议，不保证届时有容量。已接受事件的相同内容重试仍返回 200；同键不同内容仍为 409。
 
-实现为数据库单行锁串行化“检查容量 + 三表写入”，事务采用 READ COMMITTED，锁后再次检查幂等。没有独立计数器，因此无需 Worker 维护增减计数；代价是新事件接入串行化、每次查询非终态数量，后续压测再优化。配置调低到现有积压以下不会删除已有任务，只暂停接收新事件。未来失败重放也必须经过同一容量检查。
+实现为数据库单行锁串行化“检查容量 + 三表写入”，事务采用 READ COMMITTED，锁后再次检查幂等。没有独立计数器，因此无需 Worker 维护增减计数；代价是新事件接入串行化、每次查询非终态数量，后续压测再优化。配置调低到现有积压以下不会删除已有任务，只暂停接收新事件。失败重放也经过同一容量检查，与新事件共享上限。
 
 ## 查询投递
 
@@ -143,6 +135,29 @@ curl -s 'http://127.0.0.1:8080/v1/deliveries/1/attempts?limit=20' \
 - started_at 是领取时刻，latency_ms 是 Sender 耗时。领取后发现 URL 不允许时仍留失败记录，latency_ms 为 null；端点禁用或预算已耗尽时根本不领取，不新增尝试。
 - 这是执行尝试历史，不是精确的远端请求计数；尚无历史清理策略。
 
+## 失败重放
+
+先修复接收端问题，再对 failed 投递调用（替换为实际 delivery_id）：
+
+```bash
+curl -i -X POST http://127.0.0.1:8080/v1/deliveries/9/replay \
+  -H "X-API-Key: $API_KEY"
+```
+
+成功返回 202，例如：
+
+```json
+{"delivery_id":"9","event_id":"7","generation":2,"status":"pending"}
+```
+
+- 同事务执行：接入锁 → 锁定投递并检查 failed → 检查端点启用/容量 → generation+1、attempt_count=0、清空最后错误/状态码/租约 → 新 Outbox。Outbox 写入失败则整轮回滚。
+- delivery_id、event_id、payload 不变，旧 Outbox 与尝试历史不删除；attempt_count 现在表示当前 generation 的领取次数。每轮仍最多 3 次领取，人工再次重放可开启新预算。
+- 不存在返回 404；pending/processing/retrying/succeeded 返回 409 `delivery_not_replayable`；端点禁用返回 409 `endpoint_disabled`，需要先启用。
+- 满载返回 503、`Retry-After: 5`、`{"error":"backlog_full","replayed":false}`；原 failed 状态和 generation 不变，不生成新 Outbox。
+- 同一失败状态被并发请求时，只能创建一轮新执行。它不是带幂等键的重放接口：若新一轮后来又 failed，再 POST 会开启下一轮。请求超时/响应丢失时先查状态及 generation，不要盲目重复重放。
+- 旧任务被 generation 检查跳过；旧请求晚到只能补全旧历史，不能覆盖新一轮状态。已经发出的 HTTP 无法撤回，接收端仍需按稳定 delivery_id 幂等。若希望产生一次新的业务效果，应提交新事件，而不是重放。
+- 202 只表示重放事务提交，不表示已经入队或投递成功。可查询 delivery 状态和跨 generation 的 attempts 历史。
+
 ## Outbox 发布流程
 
 ```text
@@ -169,8 +184,8 @@ Outbox 状态：`pending → processing → published`。领取用短事务和 3
 - 已保存但未入队的记录由 Outbox 恢复。**已 published 后 Redis 丢失任务不在该恢复范围内**，仍需 Reconciler。
 - 容量限制针对未完成投递数量，不是总数据量或 Redis 内存限制；终态事件和 Outbox 历史仍会累积，目前没有清理机制。
 - Redis 数据丢失、任务因数据库长期故障耗尽重试、最终结果无法写库，可能遗留非终态记录；没有 Reconciler。Worker 强杀恢复时间、多实例并发尚未做故障验证。
-- 暂无人工重放、HMAC、接收端幂等、接收方 Retry-After 解析和全局端点隔离。签名密钥目前仅保存，不参与发送。
+- 暂无 HMAC、接收端幂等、接收方 Retry-After 解析和全局端点隔离。签名密钥目前仅保存，不参与发送。
 
 ## 下一步
 
-增加失败重放：复用容量检查，保持 delivery_id，递增 generation 并创建新 Outbox，保留已有历史。Redis 丢任务后的自动对账仍是后续任务。
+完善 HTTP 重试策略：接收方 Retry-After 解析、有上限的退避与抖动。之后补 HMAC 和接收方幂等；Redis 丢任务后的自动对账仍是后续任务。

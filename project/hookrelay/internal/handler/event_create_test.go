@@ -52,7 +52,7 @@ func TestPostEvent(t *testing.T) {
 						t.Fatalf("incorrect event input or context: %+v", input)
 					}
 					return store.EventResult{EventID: ^uint64(0), DeliveryID: 9, Reused: tt.reused}, tt.storeErr
-				}, nil, nil)
+				}, nil, nil, nil)
 			request := httptest.NewRequest(http.MethodPost, "/v1/events", strings.NewReader(tt.body)).WithContext(ctx)
 			request.Header.Set("Content-Type", "application/json")
 			request.Header.Set("Idempotency-Key", "order-42")

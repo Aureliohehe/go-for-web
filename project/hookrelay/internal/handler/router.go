@@ -41,6 +41,7 @@ func NewAPIRouter(
 	createEvent EventCreator,
 	findDelivery DeliveryFinder,
 	listAttempts AttemptLister,
+	replayDelivery DeliveryReplayer,
 ) *gin.Engine {
 	router := NewRouter(pingDatabase)
 
@@ -52,6 +53,7 @@ func NewAPIRouter(
 	v1.POST("/events", PostEvent(createEvent))
 	v1.GET("/deliveries/:id", GetDelivery(findDelivery))
 	v1.GET("/deliveries/:id/attempts", GetDeliveryAttempts(listAttempts))
+	v1.POST("/deliveries/:id/replay", PostDeliveryReplay(replayDelivery))
 
 	return router
 }

@@ -1,7 +1,7 @@
 # 学习进度与下次起点
 
 > 已完成接收端创建→查询及 PATCH 启用/禁用的真实 HTTP + MySQL 验证（用户反馈通过）。
-> 当前已实现 Outbox、背压和投递尝试历史/分页查询。用户已应用 000001..000004，勿重复执行；新迁移 `000005` 仅在隔离测试库验证，用户库尚未应用。下一步是失败重放。
+> 当前已实现 Outbox、背压、尝试历史和失败重放；五份迁移均已应用，本轮不新增表，勿重复导入。失败重放、容量竞争和旧 generation 隔离已在真实 MySQL/Redis 中验证。下一步完善 Retry-After、退避上限与抖动。
 
 ## 辅导方式与协作约定
 
@@ -223,10 +223,10 @@ git diff --check
 - 随后启动真实 Receiver/Worker/Dispatcher，第一条投递 succeeded、attempt_count=1；原先拒绝的键无需修改即返回 202，随后也 succeeded。**本次不是直接修改 SQL 状态模拟释放容量。**
 - 临时进程与专用 Redis 容器已清理，日志 `/tmp/hookrelay-backpressure-e2e-7QC19h`；生产代码无新增修改。下一步进入投递尝试历史与失败重放。
 
-## 最新进度：投递尝试历史
+## 此前进度：投递尝试历史
 
 - 本轮沿用未提交的背压代码，未覆盖/清理用户改动，也未自动提交。
-- 新增 `000005_create_delivery_attempts.up.sql`：delivery_id/generation/attempt_number 唯一，按 delivery_id/id 建分页索引；只记录新执行，不补造已有次数对应的历史。**仅在隔离测试库执行，用户侧未应用。** 升级先停止旧 Worker，再应用新表并启动新版 API/Worker。
+- 新增 `000005_create_delivery_attempts.up.sql`：delivery_id/generation/attempt_number 唯一，按 delivery_id/id 建分页索引；只记录新执行，不补造已有次数对应的历史。**用户随后授权助手导入：已确认旧应用进程未运行，在 Compose MySQL 的 hookrelay 中执行成功；SHOW CREATE TABLE 验证结构、唯一约束、索引和外键，历史记录为 0，总计 6 张表。** 未修改已有业务记录，未启动业务进程，MySQL/Redis 保持原运行状态。
 - `internal/store/delivery_work.go`：Claim 在原领取事务中登记 processing 尝试；Finish 在同一事务回写投递和尝试，保存 finished_at/http_status/error_class/latency_ms。已完成历史不变；晚到结果可补全自己的未完成历史，但不能覆盖新 generation/attempt_count 的投递状态。
 - `internal/store/delivery_attempt.go` + `internal/handler/delivery_attempts.go`：`GET /v1/deliveries/:id/attempts?limit=20&after=0`，需 API Key，默认 20 条、最多 100；响应 items 和 next_after（空字符串表示当前无下一页），IDs 用字符串。不存在投递 404，未执行过为空数组。
 - `internal/delivery/worker.go` 传递 Sender 耗时并区分 http_error、network_error、timeout、canceled；不保存原始 URL/payload/错误详情。URL 不允许的领取保留失败历史，但无 Sender 耗时。
@@ -234,6 +234,18 @@ git diff --check
 - **实际验证通过**：go test/vet/全包 race；临时 MySQL 8.0.42 + Redis 7.4 下登记失败回滚领取、结果历史缺失回滚状态、重复结果不改旧历史、晚到结果隔离、未知结果保留、分页、背压与 Outbox 回归。历史存储测试连续 3 次通过；真实队列测试增加经本地 HTTP API 查询分页的断言。
 - 临时服务已清理，测试日志 `/tmp/hookrelay-history-cU2d99`。未读取 `.env`、未执行用户数据库迁移、未操作已有服务。
 - 下一步失败重放：容量接入锁→只允许 failed→generation+1→重置本轮预算→新 Outbox 同事务，保持 delivery_id，不删除历史。
+
+## 最新进度：失败重放
+
+- 新增 `internal/store/delivery_replay.go`、`internal/handler/delivery_replay.go`，接入 `POST /v1/deliveries/:id/replay`，API Key 鉴权，无请求体。本轮无迁移，用户库已有 000001..000005 不要重复执行。
+- 同事务：接入锁→投递行锁→只允许 failed→检查端点 enabled 与容量→generation+1、重置本轮 attempt_count 和最后诊断/租约→写新 Outbox。不创建新 event/delivery，不删除历史，不直接访问 Redis。
+- 成功 202 返回原 delivery_id/event_id、新 generation 和 pending；不存在 404，非 failed/端点禁用 409；容量不足 503 + Retry-After:5 + replayed:false，不改变原记录。
+- 复用 generation 防止旧任务再次执行/覆盖新状态；旧未完成 HTTP 结果可补全自己的历史。每轮计数从 0 开始、最多 3 次领取，历史按 generation 分轮保留。Worker 日志新增 generation。
+- 重放不是幂等键接口：同一失败轮次并发请求只接受一次，但新一轮再次 failed 后又 POST 会再开启一轮。响应不确定时先查状态/generation，不盲目重复。稳定 delivery_id 不代表远端恰好一次，接收方幂等仍待实现。
+- **实际验证**：单测/vet/全包 race 通过；隔离 MySQL 8.0.42 + Redis 7.4 上重放事务回滚、八请求并发只创建一轮、禁用/非终态拒绝、新事件与重放共享最后一个容量名额、旧任务/旧结果隔离均通过。重放与容量测试连续三次通过。
+- 真实 HTTP + 队列测试：接收端第一次 400 → 原任务归档 → POST replay 返回 generation=2 → 人工注入旧 generation 队列任务被跳过 → 新 Outbox 发布 → 接收端 204 → 同一 delivery_id succeeded，历史同时保留两轮。重复 pending/succeeded 重放返回 409。
+- 未读取 `.env`、未修改用户数据库或启停用户已有服务；临时实例已清理，日志 `/tmp/hookrelay-replay-XhdMy6`。保留此前未提交的迁移确认文档改动，无自动提交/推送。
+- 下一步补接收方 Retry-After、有上限的指数退避和抖动，再进入 HMAC 与接收方幂等。
 
 ## 下次恢复环境
 
@@ -256,7 +268,7 @@ export ALLOWED_ENDPOINT_URL="${ALLOWED_ENDPOINT_URL:-http://127.0.0.1:9090/webho
 export REDIS_ADDR="${REDIS_ADDR:-127.0.0.1:16379}"
 export MAX_PENDING_DELIVERIES="${MAX_PENDING_DELIVERIES:-10000}"
 
-# 000001..000004 已完成；首次升级先按 README 应用新迁移 000005。
+# 000001..000005 均已完成，不要重复执行迁移。
 go run ./cmd/api
 # 另外三个终端（Worker/Dispatcher 也需加载上述环境）：
 # go run ./cmd/dispatcher

@@ -39,7 +39,7 @@ func TestGetDelivery(t *testing.T) {
 						t.Fatal("incorrect ID or context")
 					}
 					return store.Delivery{ID: id, EventID: ^uint64(0), Status: "pending", Generation: 1, CreatedAt: now, UpdatedAt: now}, tt.dbErr
-				}, nil)
+				}, nil, nil)
 			request := httptest.NewRequest(http.MethodGet, "/v1/deliveries/"+tt.id, nil).WithContext(ctx)
 			request.Header.Set("X-API-Key", tt.key)
 			response := httptest.NewRecorder()

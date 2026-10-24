@@ -61,10 +61,15 @@ func TestAsyncDelivery(t *testing.T) {
 
 	var mu sync.Mutex
 	counts := map[string]int{}
+	deliveryIDs := map[string]string{}
 	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		mu.Lock()
 		counts[string(body)]++
+		if previous := deliveryIDs[string(body)]; previous != "" && previous != r.Header.Get("X-Webhook-ID") {
+			t.Error("delivery ID changed between attempts")
+		}
+		deliveryIDs[string(body)] = r.Header.Get("X-Webhook-ID")
 		count := counts[string(body)]
 		mu.Unlock()
 		if r.Header.Get("X-Webhook-ID") == "" {
@@ -74,6 +79,11 @@ func TestAsyncDelivery(t *testing.T) {
 		case `"temporary"`:
 			if count == 1 {
 				w.WriteHeader(500)
+				return
+			}
+		case `"replay"`:
+			if count == 1 {
+				w.WriteHeader(400)
 				return
 			}
 		case `"permanent"`:
@@ -138,6 +148,8 @@ func TestAsyncDelivery(t *testing.T) {
 	api := httptest.NewServer(handler.NewAPIRouter(pool.PingContext, "test-key", receiver.URL, nil, nil, nil, nil, nil,
 		func(ctx context.Context, id, after uint64, limit int) ([]store.DeliveryAttempt, error) {
 			return store.ListDeliveryAttempts(ctx, db, id, after, limit)
+		}, func(ctx context.Context, id uint64) (store.Delivery, error) {
+			return store.ReplayDelivery(ctx, db, id, 10000)
 		}))
 	defer api.Close()
 	enqueue := func(ctx context.Context, id uint64, generation uint32) error {
@@ -290,6 +302,76 @@ func TestAsyncDelivery(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("HTTP replay preserves ID and history across generations", func(t *testing.T) {
+		result := create(t, "replay")
+		dispatch(t)
+		waitDelivery(t, result.DeliveryID, "failed")
+		waitQueueFinal(t, result.DeliveryID, true)
+		replay := func(want int) {
+			req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/v1/deliveries/%d/replay", api.URL, result.DeliveryID), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("X-API-Key", "test-key")
+			resp, err := api.Client().Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			var got map[string]any
+			if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+				t.Fatal(err)
+			}
+			if resp.StatusCode != want {
+				t.Fatalf("replay HTTP status=%d response=%v", resp.StatusCode, got)
+			}
+			if want == 202 && (got["delivery_id"] != fmt.Sprint(result.DeliveryID) || got["event_id"] != fmt.Sprint(result.EventID) || got["generation"] != float64(2) || got["status"] != "pending") {
+				t.Fatal("replay changed IDs or wrong generation")
+			}
+		}
+		replay(202)
+		replay(409) // Already pending; a second replay must not create another round.
+
+		// Force an old-generation task past queue deduplication to verify the
+		// Worker checks the database generation, not just the Redis task ID.
+		body, _ := json.Marshal(task.Payload{DeliveryID: result.DeliveryID, Generation: 1})
+		staleID := "stale-" + uuid.NewString()
+		if _, err := client.EnqueueContext(ctx, asynq.NewTask(task.TypeDelivery, body), asynq.Queue(queue), asynq.TaskID(staleID), asynq.MaxRetry(0)); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			_, err := inspector.GetTaskInfo(queue, staleID)
+			if errors.Is(err, asynq.ErrTaskNotFound) {
+				break
+			}
+			if err != nil || time.Now().After(deadline) {
+				t.Fatalf("stale task not consumed: %v", err)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		pending, err := store.FindDelivery(ctx, db, result.DeliveryID)
+		if err != nil || pending.Generation != 2 || pending.Status != "pending" || pending.AttemptCount != 0 {
+			t.Fatal("old task changed replay state")
+		}
+		dispatch(t)
+		completed := waitDelivery(t, result.DeliveryID, "succeeded")
+		if completed.Generation != 2 || completed.AttemptCount != 1 || completed.EventID != result.EventID {
+			t.Fatal("replayed delivery did not complete in a new generation")
+		}
+		history, err := store.ListDeliveryAttempts(ctx, db, result.DeliveryID, 0, 100)
+		if err != nil || len(history) != 2 || history[0].Generation != 1 || history[0].Status != "failed" || history[1].Generation != 2 || history[1].AttemptNumber != 1 || history[1].Status != "succeeded" {
+			t.Fatal("replay did not preserve both generations of history")
+		}
+		mu.Lock()
+		sent := counts[`"replay"`]
+		mu.Unlock()
+		if sent != 2 {
+			t.Fatalf("stale task caused an extra send: %d", sent)
+		}
+		replay(409) // Success cannot be replayed.
+	})
 
 	t.Run("Redis unavailable then restored", func(t *testing.T) {
 		// Use a closed local port, without stopping or mutating the user's Redis.
