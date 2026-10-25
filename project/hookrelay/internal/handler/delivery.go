@@ -34,6 +34,7 @@ func GetDelivery(find DeliveryFinder) gin.HandlerFunc {
 			"status":           delivery.Status,
 			"generation":       delivery.Generation,
 			"attempt_count":    delivery.AttemptCount,
+			"recovery_count":   delivery.RecoveryCount,
 			"last_http_status": delivery.LastHTTPStatus,
 			"last_error":       delivery.LastError,
 			"created_at":       delivery.CreatedAt,

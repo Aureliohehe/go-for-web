@@ -57,7 +57,7 @@ func TestGetDelivery(t *testing.T) {
 				}
 				return
 			}
-			if len(got) != 9 || got["last_http_status"] != nil || got["last_error"] != nil || got["id"] != "9" || got["event_id"] != "18446744073709551615" ||
+			if len(got) != 10 || got["recovery_count"] != float64(0) || got["last_http_status"] != nil || got["last_error"] != nil || got["id"] != "9" || got["event_id"] != "18446744073709551615" ||
 				got["status"] != "pending" || got["generation"] != float64(1) || got["attempt_count"] != float64(0) ||
 				got["created_at"] != now.Format(time.RFC3339Nano) || got["updated_at"] != now.Format(time.RFC3339Nano) {
 				t.Fatalf("unexpected delivery: %v", got)

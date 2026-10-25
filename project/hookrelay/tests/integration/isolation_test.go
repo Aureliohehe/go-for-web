@@ -132,7 +132,8 @@ func TestEndpointIsolation(t *testing.T) {
 	var mu sync.Mutex
 	deferred := map[uint64]int{}
 	sender := delivery.NewSender(15 * time.Second)
-	worker := delivery.Worker{Store: store.DeliveryStore{DB: db}, AllowedURL: receiver.URL, Limiter: delivery.NewEndpointLimiter(1),
+	retryPolicy := delivery.RetryPolicy{BaseDelay: 100 * time.Millisecond, MaxDelay: time.Second}
+	worker := delivery.Worker{Store: store.DeliveryStore{DB: db}, AllowedURL: receiver.URL, Limiter: delivery.NewEndpointLimiter(1), RetryPolicy: retryPolicy,
 		Send: func(ctx context.Context, req delivery.Request) (delivery.Result, error) {
 			if req.DeliveryID == fmt.Sprint(zeroRetryID) {
 				if max, ok := asynq.GetMaxRetry(ctx); !ok || max != 0 {
@@ -141,19 +142,20 @@ func TestEndpointIsolation(t *testing.T) {
 			}
 			return sender.Send(ctx, req)
 		},
-		Defer: func(ctx context.Context, id uint64, gen uint32) error {
-			if err := deferrer.DeferDelivery(ctx, id, gen); err != nil {
-				return err
+		Defer: func(ctx context.Context, id uint64, gen uint32) (string, error) {
+			queueID, err := deferrer.DeferDelivery(ctx, id, gen)
+			if err != nil {
+				return "", err
 			}
 			mu.Lock()
 			deferred[id]++
 			mu.Unlock()
-			return nil
+			return queueID, nil
 		},
 	}
 	jobs := asynq.NewServer(redis, asynq.Config{Concurrency: 4, Queues: map[string]int{queue: 1},
 		TaskCheckInterval: 20 * time.Millisecond, DelayedTaskCheckInterval: 50 * time.Millisecond, ShutdownTimeout: 3 * time.Second,
-		RetryDelayFunc: (delivery.RetryPolicy{BaseDelay: 100 * time.Millisecond, MaxDelay: time.Second}).Delay,
+		RetryDelayFunc: retryPolicy.Delay,
 	})
 	mux := asynq.NewServeMux()
 	mux.Handle(task.TypeDelivery, worker)

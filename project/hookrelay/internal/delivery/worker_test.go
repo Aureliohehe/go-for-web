@@ -17,10 +17,18 @@ type testRepository struct {
 	claimErr, finishErr error
 	status, reason      string
 	httpStatus          int
-	latency             time.Duration
+	latency, retryDelay time.Duration
 	claims, finishes    int
 	endpointID          uint64
 	lookupErr           error
+	checkFinishContext  func(context.Context)
+	trackedTask         string
+	trackErr            error
+}
+
+func (r *testRepository) TrackTask(_ context.Context, _ uint64, _ uint32, queueID string) error {
+	r.trackedTask = queueID
+	return r.trackErr
 }
 
 func (r *testRepository) EndpointID(context.Context, uint64, uint32) (uint64, error) {
@@ -31,9 +39,12 @@ func (r *testRepository) Claim(_ context.Context, id uint64, gen uint32, max uin
 	r.claims++
 	return r.work, r.claimErr
 }
-func (r *testRepository) Finish(_ context.Context, work *store.DeliveryWork, status string, httpStatus int, reason string, latency time.Duration) error {
+func (r *testRepository) Finish(ctx context.Context, work *store.DeliveryWork, status string, httpStatus int, reason string, latency, retryDelay time.Duration) error {
+	if r.checkFinishContext != nil {
+		r.checkFinishContext(ctx)
+	}
 	r.finishes++
-	r.latency = latency
+	r.latency, r.retryDelay = latency, retryDelay
 	r.status, r.reason, r.httpStatus = status, reason, httpStatus
 	return r.finishErr
 }
@@ -71,7 +82,7 @@ func TestWorker(t *testing.T) {
 				}
 			}
 			sends := 0
-			worker := Worker{Store: repo, AllowedURL: "http://receiver/webhook", Send: func(_ context.Context, req Request) (Result, error) {
+			worker := Worker{Store: repo, RetryPolicy: RetryPolicy{BaseDelay: time.Second, MaxDelay: 10 * time.Second}, AllowedURL: "http://receiver/webhook", Send: func(_ context.Context, req Request) (Result, error) {
 				sends++
 				if req.DeliveryID != "9" || req.URL != "http://receiver/webhook" || string(req.Payload) != `{ "id": 1 }` || req.SigningSecret != testSigningSecret {
 					t.Fatal("wrong sender input")
@@ -93,6 +104,13 @@ func TestWorker(t *testing.T) {
 			if wantHint && (retry.after != "20" || retry.attempt != tt.attempt) {
 				t.Fatal("retry metadata lost between Sender and queue")
 			}
+			if tt.status == "retrying" {
+				if repo.retryDelay != 10*time.Second || worker.RetryPolicy.Delay(0, err, nil) != repo.retryDelay {
+					t.Fatal("DB and queue must share the selected, capped Retry-After")
+				}
+			} else if repo.retryDelay != 0 {
+				t.Fatal("terminal results must clear retry cooldown")
+			}
 			wantSends := 1
 			if tt.terminal || tt.claimErr != nil || tt.disallowed {
 				wantSends = 0
@@ -113,6 +131,76 @@ func TestWorker(t *testing.T) {
 				t.Fatalf("sends=%d want=%d", sends, wantSends)
 			}
 		})
+	}
+}
+
+func TestWorkerBusyLease(t *testing.T) {
+	for _, mode := range []string{"deferred", "enqueue failed", "tracking failed", "missing deferrer"} {
+		t.Run(mode, func(t *testing.T) {
+			repo := &testRepository{claimErr: store.ErrDeliveryBusy}
+			if mode == "tracking failed" {
+				repo.trackErr = errors.New("db unavailable")
+			}
+			worker := Worker{Store: repo}
+			deferred := false
+			if mode != "missing deferrer" {
+				worker.Defer = func(_ context.Context, id uint64, generation uint32) (string, error) {
+					deferred = true
+					if id != 9 || generation != 2 {
+						t.Fatal("deferral changed delivery identity")
+					}
+					if mode == "enqueue failed" {
+						return "", errors.New("redis unavailable")
+					}
+					return "replacement-task", nil
+				}
+			}
+			err := worker.ProcessTask(context.Background(), asynq.NewTask(task.TypeDelivery, []byte(`{"delivery_id":9,"generation":2}`)))
+			if (err == nil) != (mode == "deferred") || deferred != (mode != "missing deferrer") || repo.claims != 1 || repo.finishes != 0 {
+				t.Fatalf("busy work must defer without sending or finishing: %v", err)
+			}
+			if mode == "deferred" && repo.trackedTask != "replacement-task" {
+				t.Fatal("replacement must be tracked before acknowledging")
+			}
+		})
+	}
+}
+
+func TestWorkerPersistsAfterCancellation(t *testing.T) {
+	for _, succeeded := range []bool{true, false} {
+		ctx, cancel := context.WithCancel(context.Background())
+		repo := &testRepository{work: &store.DeliveryWork{
+			Delivery: store.Delivery{ID: 9, Generation: 1, AttemptCount: 1},
+			Endpoint: store.Endpoint{URL: "http://receiver"},
+		}}
+		var finishContext context.Context
+		repo.checkFinishContext = func(ctx context.Context) {
+			finishContext = ctx
+			deadline, ok := ctx.Deadline()
+			if ctx.Err() != nil || !ok || time.Until(deadline) <= 0 || time.Until(deadline) > task.ResultTimeout {
+				t.Fatal("result persistence needs an independent, bounded context")
+			}
+		}
+		worker := Worker{Store: repo, AllowedURL: "http://receiver", Send: func(sendCtx context.Context, _ Request) (Result, error) {
+			cancel()
+			if sendCtx.Err() != context.Canceled {
+				t.Fatal("HTTP must still observe task cancellation")
+			}
+			if succeeded {
+				return Result{HTTPStatus: 204}, nil
+			}
+			return Result{Retryable: true}, context.Canceled
+		}}
+		err := worker.ProcessTask(ctx, asynq.NewTask(task.TypeDelivery, []byte(`{"delivery_id":9,"generation":1}`)))
+		if repo.finishes != 1 || (err == nil) != succeeded || (repo.status == "succeeded") != succeeded {
+			t.Fatalf("observed result was not persisted: status=%s err=%v", repo.status, err)
+		}
+		if !succeeded && (repo.status != "retrying" || repo.reason != "canceled") {
+			t.Fatal("canceled HTTP should remain retryable")
+		}
+		if finishContext.Err() != context.Canceled {
+			t.Fatal("finish context timer was not released")
+		}
 	}
 }
 

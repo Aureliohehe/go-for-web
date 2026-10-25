@@ -9,7 +9,7 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-var ErrDeliveryBusy = errors.New("delivery lease is active")
+var ErrDeliveryBusy = errors.New("delivery lease or retry cooldown is active")
 
 type DeliveryWork struct {
 	AttemptID uint64
@@ -53,6 +53,9 @@ func (s DeliveryStore) Claim(ctx context.Context, id uint64, generation uint32, 
 			return nil
 		}
 		now := time.Now().UTC().Truncate(time.Microsecond)
+		// processing: execution lease; retrying: earliest permitted retry.
+		// This also fences duplicate queue tasks that arrive before Asynq's
+		// delayed retry, without consuming another attempt or history row.
 		if d.LeaseUntil != nil && d.LeaseUntil.After(now) {
 			return ErrDeliveryBusy
 		}
@@ -98,14 +101,21 @@ func (s DeliveryStore) Claim(ctx context.Context, id uint64, generation uint32, 
 
 // Attempt count is an execution token: a late result cannot overwrite a newer
 // attempt or generation. A crashed attempt consumes budget even before HTTP.
-func (s DeliveryStore) Finish(ctx context.Context, work *DeliveryWork, status string, httpStatus int, reason string, latency time.Duration) error {
+// retryDelay gates the next Claim only for retrying results (zero means immediate).
+// It is persisted with the result, not scheduled by a separate database poller.
+func (s DeliveryStore) Finish(ctx context.Context, work *DeliveryWork, status string, httpStatus int, reason string, latency, retryDelay time.Duration) error {
 	return s.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var notBefore *time.Time
+		if status == "retrying" && retryDelay > 0 {
+			until := time.Now().UTC().Add(retryDelay).Truncate(time.Microsecond)
+			notBefore = &until
+		}
 		// Lock/update delivery before history, in the same order as Claim.
 		updated := tx.Model(&Delivery{}).
 			Where("id = ? AND generation = ? AND attempt_count = ? AND status = ?",
 				work.Delivery.ID, work.Delivery.Generation, work.Delivery.AttemptCount, "processing").
 			Updates(map[string]any{
-				"status": status, "last_http_status": httpStatus, "last_error": reason, "lease_until": nil,
+				"status": status, "last_http_status": httpStatus, "last_error": reason, "lease_until": notBefore,
 			})
 		if updated.Error != nil {
 			return updated.Error

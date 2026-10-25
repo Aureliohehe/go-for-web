@@ -56,12 +56,12 @@ func TestWorkerSaturatedEndpoint(t *testing.T) {
 	defer release()
 	repo := &testRepository{endpointID: 7}
 	deferrals := 0
-	worker := Worker{Store: repo, Limiter: limiter, Defer: func(_ context.Context, id uint64, generation uint32) error {
+	worker := Worker{Store: repo, Limiter: limiter, Defer: func(_ context.Context, id uint64, generation uint32) (string, error) {
 		deferrals++
 		if id != 9 || generation != 2 {
 			t.Fatal("deferred identity changed")
 		}
-		return nil
+		return "replacement-task", nil
 	}, Send: func(context.Context, Request) (Result, error) {
 		t.Fatal("saturated endpoint sent HTTP")
 		return Result{}, nil
@@ -75,7 +75,7 @@ func TestWorkerSaturatedEndpoint(t *testing.T) {
 	if deferrals != 5 || repo.claims != 0 || repo.finishes != 0 {
 		t.Fatal("deferral consumed attempts or skipped scheduling")
 	}
-	worker.Defer = func(context.Context, uint64, uint32) error { return errors.New("redis unavailable") }
+	worker.Defer = func(context.Context, uint64, uint32) (string, error) { return "", errors.New("redis unavailable") }
 	if err := worker.ProcessTask(context.Background(), job); err == nil {
 		t.Fatal("failed enqueue must not acknowledge task")
 	}

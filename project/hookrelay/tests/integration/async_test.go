@@ -174,9 +174,9 @@ func TestAsyncDelivery(t *testing.T) {
 	}()
 	deferrer := task.NewClient(cfg.RedisAddr)
 	defer deferrer.Close()
-	worker := delivery.Worker{Store: store.DeliveryStore{DB: db}, Send: delivery.NewSender(time.Second).Send, AllowedURL: receiver.URL,
-		Limiter: delivery.NewEndpointLimiter(1), Defer: deferrer.DeferDelivery}
 	retryPolicy := delivery.RetryPolicy{BaseDelay: 100 * time.Millisecond, MaxDelay: 2 * time.Second}
+	worker := delivery.Worker{Store: store.DeliveryStore{DB: db}, Send: delivery.NewSender(time.Second).Send, AllowedURL: receiver.URL,
+		Limiter: delivery.NewEndpointLimiter(1), Defer: deferrer.DeferDelivery, RetryPolicy: retryPolicy}
 	server := asynq.NewServer(redis, asynq.Config{
 		Concurrency: 4, Queues: map[string]int{queue: 1},
 		TaskCheckInterval: 50 * time.Millisecond, DelayedTaskCheckInterval: 100 * time.Millisecond,
@@ -263,7 +263,10 @@ func TestAsyncDelivery(t *testing.T) {
 		deadline := time.Now().Add(5 * time.Second)
 		for {
 			info, err := inspector.GetTaskInfo(queue, fmt.Sprintf("delivery-%d-1", id))
-			if !archived && errors.Is(err, asynq.ErrTaskNotFound) {
+			// A retry rounded down by Asynq may be deferred by the DB cooldown.
+			// In that case the original task is gone; a replacement reaches the
+			// terminal delivery state already checked by waitDelivery.
+			if errors.Is(err, asynq.ErrTaskNotFound) {
 				return
 			}
 			if archived && err == nil && info.State == asynq.TaskStateArchived {

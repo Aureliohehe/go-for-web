@@ -59,7 +59,7 @@ func TestReplayDeliveryIntegration(t *testing.T) {
 		t.Fatal("claim failed")
 	}
 	reject() // processing
-	if err := repo.Finish(ctx, work, "retrying", 500, "http_error", time.Millisecond); err != nil {
+	if err := repo.Finish(ctx, work, "retrying", 500, "http_error", time.Millisecond, 0); err != nil {
 		t.Fatal(err)
 	}
 	reject() // retrying
@@ -67,7 +67,7 @@ func TestReplayDeliveryIntegration(t *testing.T) {
 	if err != nil || work == nil {
 		t.Fatal("retry claim failed")
 	}
-	if err := repo.Finish(ctx, work, "failed", 400, "http_error", 2*time.Millisecond); err != nil {
+	if err := repo.Finish(ctx, work, "failed", 400, "http_error", 2*time.Millisecond, 0); err != nil {
 		t.Fatal(err)
 	}
 	before, err := FindDelivery(ctx, db, first.DeliveryID)
@@ -139,7 +139,7 @@ func TestReplayDeliveryIntegration(t *testing.T) {
 	if stale, err := repo.Claim(ctx, first.DeliveryID, 1, 3, time.Minute); err != nil || stale != nil {
 		t.Fatal("old generation must skip")
 	}
-	if err := repo.Finish(ctx, work, "succeeded", 200, "", time.Millisecond); err != nil {
+	if err := repo.Finish(ctx, work, "succeeded", 200, "", time.Millisecond, 0); err != nil {
 		t.Fatal(err)
 	}
 	current, err := FindDelivery(ctx, db, first.DeliveryID)
@@ -150,7 +150,7 @@ func TestReplayDeliveryIntegration(t *testing.T) {
 	if err != nil || newWork == nil || newWork.Delivery.AttemptCount != 1 {
 		t.Fatal("new generation must start at attempt 1")
 	}
-	if err := repo.Finish(ctx, newWork, "succeeded", 204, "", time.Millisecond); err != nil {
+	if err := repo.Finish(ctx, newWork, "succeeded", 204, "", time.Millisecond, 0); err != nil {
 		t.Fatal(err)
 	}
 	reject() // succeeded
@@ -171,7 +171,7 @@ func TestReplayDeliveryIntegration(t *testing.T) {
 	if _, err := ReplayDelivery(ctx, db, late.DeliveryID, 10000); err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.Finish(ctx, old, "succeeded", 200, "", time.Millisecond); err != nil {
+	if err := repo.Finish(ctx, old, "succeeded", 200, "", time.Millisecond, 0); err != nil {
 		t.Fatal(err)
 	}
 	current, err = FindDelivery(ctx, db, late.DeliveryID)

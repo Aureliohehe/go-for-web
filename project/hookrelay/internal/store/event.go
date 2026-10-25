@@ -29,6 +29,8 @@ type Delivery struct {
 	Status         string
 	Generation     uint32
 	AttemptCount   uint32
+	QueueTaskID    string
+	RecoveryCount  uint32
 	LastHTTPStatus *int
 	LastError      *string
 	LeaseUntil     *time.Time

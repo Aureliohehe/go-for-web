@@ -17,18 +17,21 @@ import (
 
 type Repository interface {
 	EndpointID(context.Context, uint64, uint32) (uint64, error)
+	TrackTask(context.Context, uint64, uint32, string) error
 	Claim(context.Context, uint64, uint32, uint32, time.Duration) (*store.DeliveryWork, error)
-	Finish(context.Context, *store.DeliveryWork, string, int, string, time.Duration) error
+	Finish(context.Context, *store.DeliveryWork, string, int, string, time.Duration, time.Duration) error
 }
 
 type Worker struct {
-	Store      Repository
-	Send       func(context.Context, Request) (Result, error)
-	AllowedURL string
-	Limiter    *EndpointLimiter
-	// Defer enqueues a delayed replacement before this task is acknowledged.
-	// It must preserve the queue and remaining Asynq retry budget.
-	Defer func(context.Context, uint64, uint32) error
+	Store       Repository
+	Send        func(context.Context, Request) (Result, error)
+	AllowedURL  string
+	Limiter     *EndpointLimiter
+	RetryPolicy RetryPolicy
+	// Defer enqueues a delayed replacement for endpoint saturation, an active
+	// delivery lease or retry cooldown before acknowledgement. It must preserve the
+	// queue and remaining Asynq retry budget.
+	Defer func(context.Context, uint64, uint32) (string, error)
 }
 
 func (w Worker) ProcessTask(ctx context.Context, t *asynq.Task) error {
@@ -46,15 +49,17 @@ func (w Worker) ProcessTask(ctx context.Context, t *asynq.Task) error {
 		}
 		release, ok := w.Limiter.TryAcquire(id)
 		if !ok {
-			if w.Defer == nil || w.Defer(ctx, payload.DeliveryID, payload.Generation) != nil {
-				return errors.New("defer saturated endpoint failed")
-			}
-			// No claim, attempt/history write, HTTP send or ordinary retry here.
-			return nil
+			return w.deferTask(ctx, payload)
 		}
 		defer release() // Also releases on Claim/Finish errors, cancellation or panic.
 	}
 	work, err := w.Store.Claim(ctx, payload.DeliveryID, payload.Generation, task.MaxAttempts, task.LeaseDuration)
+	if errors.Is(err, store.ErrDeliveryBusy) {
+		// A duplicate task or a previous attempt whose result could not be saved
+		// may still own the lease. The last result may also impose a retry
+		// cooldown. Neither wait should exhaust the queue retry budget.
+		return w.deferTask(ctx, payload)
+	}
 	if err != nil {
 		return errors.New("claim delivery failed")
 	}
@@ -96,17 +101,46 @@ func (w Worker) ProcessTask(ctx context.Context, t *asynq.Task) error {
 			status = "retrying"
 		}
 	}
+	retry := &retryError{message: "delivery temporarily failed", after: result.RetryAfter, attempt: work.Delivery.AttemptCount}
+	if status == "retrying" {
+		// Select once: both DB and queue enforce the same backoff/Retry-After.
+		// Asynq may round schedules down to seconds; Claim remains authoritative.
+		retry.delay = w.RetryPolicy.Delay(0, retry, t)
+	}
+	// HTTP must honor task cancellation, but persisting its observed result must
+	// not inherit that cancellation or an almost-expired task deadline. Keep
+	// cleanup bounded; generation/attempt fencing still rejects late updates.
 	// Do not record raw HTTP errors: they can contain URLs or credentials.
-	if err := w.Store.Finish(ctx, work, status, result.HTTPStatus, reason, result.Latency); err != nil {
-		return &retryError{message: "save delivery result failed", after: result.RetryAfter, attempt: work.Delivery.AttemptCount}
+	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), task.ResultTimeout)
+	defer cancel()
+	if err := w.Store.Finish(finishCtx, work, status, result.HTTPStatus, reason, result.Latency, retry.delay); err != nil {
+		retry.message = "save delivery result failed"
+		return retry
 	}
 	slog.Info("delivery attempt", "event_id", work.Event.ID, "delivery_id", work.Delivery.ID,
 		"generation", work.Delivery.Generation, "attempt", work.Delivery.AttemptCount, "status", status, "http_status", result.HTTPStatus, "latency_ms", result.Latency.Milliseconds())
 	if status == "retrying" {
-		return &retryError{message: "delivery temporarily failed", after: result.RetryAfter, attempt: work.Delivery.AttemptCount}
+		return retry
 	}
 	if status == "failed" {
 		return fmt.Errorf("delivery failed: %w", asynq.SkipRetry)
 	}
+	return nil
+}
+
+func (w Worker) deferTask(ctx context.Context, payload task.Payload) error {
+	if w.Defer == nil {
+		return errors.New("defer delivery failed")
+	}
+	queueID, err := w.Defer(ctx, payload.DeliveryID, payload.Generation)
+	if err != nil || queueID == "" {
+		return errors.New("defer delivery failed")
+	}
+	// Never acknowledge until both enqueue and task tracking succeed. A crash
+	// between them can duplicate tasks; recovery fences the old generation.
+	if err := w.Store.TrackTask(ctx, payload.DeliveryID, payload.Generation, queueID); err != nil {
+		return errors.New("save deferred task failed")
+	}
+	// No attempt/history write, HTTP send or ordinary retry is consumed.
 	return nil
 }

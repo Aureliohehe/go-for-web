@@ -132,7 +132,7 @@ Outbox 已发布并不等于任务已经完成。如果 Redis 丢失已入队数
 | --- | --- | --- |
 | `endpoints` | id、url、signing_secret、enabled、created_at | 接收端配置；密钥不通过查询接口返回 |
 | `events` | id、idempotency_key、request_hash、endpoint_id、event_type、payload、created_at | idempotency_key 唯一，持久化业务事件 |
-| `deliveries` | id、event_id、status、generation、attempt_count、last_http_status、last_error、lease_until、created_at、updated_at | 第一版 event_id 唯一；id 是稳定的投递标识 |
+| `deliveries` | id、event_id、status、generation、attempt_count、queue_task_id、recovery_count、last_http_status、last_error、lease_until、created_at、updated_at | 第一版 event_id 唯一；id 是稳定的投递标识 |
 | `outbox` | id、delivery_id、generation、status、available_at、lease_until、publish_attempts、last_error | 每轮执行的可靠入队记录，索引支持扫描 |
 | `delivery_attempts` | id、delivery_id、generation、started_at、finished_at、http_status、error_class、latency_ms | 追加历史，不因重放而删除 |
 
@@ -160,7 +160,7 @@ failed ──人工重放──► pending（generation + 1）
 
 - 自动重试和人工重放都保持同一个 `delivery_id`，使接收方仍能去重。
 - 人工重放只允许最终失败记录，使用条件更新避免并发重放。
-- 重放在同一事务内递增 generation、更新状态并写入新 Outbox。
+- 重放在同一事务内递增 generation、更新状态并写入新 Outbox；重置业务尝试与自动恢复预算。自动对账恢复也递增 generation，但保留已消耗的 attempt_count。
 - 任务携带 generation；旧版本任务不应再次执行或覆盖新一轮状态。
 - 旧 HTTP 请求可能已在网络中，generation 无法撤回外部副作用。
 - 真正要求再次产生业务效果时，应提交一个新事件，而不是重放已有事件。
@@ -309,7 +309,7 @@ hookrelay/
 
 ### 第 6 周：故障验证与可交付版本
 
-- [ ] 增加过期任务检查与受控恢复；若不完成则明确 Redis 数据丢失的限制。
+- [x] 增加过期任务检查与受控恢复：追踪延期队列 ID，结合 published Outbox、活动/租约宽限期与队列状态，事务内递增 generation 并写新 Outbox；保留尝试预算、限制恢复次数。隔离库单任务删除/归档恢复已验证，完整 Redis 清空和进程强杀仍未验证。
 - [ ] 完成下方故障矩阵中的核心场景。
 - [ ] 增加接入量、投递结果、耗时、Outbox 积压及最老记录年龄等指标。
 - [ ] 建立 CI：格式检查、go vet、单元测试、集成测试。
@@ -397,4 +397,4 @@ hookrelay/
 
 当前已完成端点管理、事件幂等、三表事务 Outbox、Dispatcher、投递查询、单 Worker Asynq 异步闭环及本地模拟接收端。助手在隔离 MySQL 8.0.42/Redis 7.4 上验证了事务回滚、并发幂等、租约恢复、重复发布及队列重试，并验证了 Redis 不可用时 API 仍接收、恢复后自动投递。
 
-已补积压背压、投递历史/分页及失败重放，并在隔离 MySQL/Redis 下验证事务原子性、并发容量与重放、旧轮次隔离和 HTTP 重放闭环。Retry-After、退避、HMAC 与接收端事务性持久化幂等均已在隔离 MySQL 8.4/Redis 7.4 中验证，包括处理成功但响应超时后的重投。新增 `scripts/test-integration.sh` 可一键创建并清理隔离测试环境，不读取用户 `.env`。单 Worker 内端点并发限制和慢端点隔离测试也已完成；满额任务在领取前通过 Asynq 延迟替换，保留业务 ID 和剩余普通重试预算。下一步验证 Worker 强杀恢复及等待时间。Outbox 不解决已发布后 Redis 数据丢失；延期任务也不能仅凭初始队列 ID 对账。没有对账及完整故障测试，不能宣称完整可靠版本。最新运行步骤与验证边界见 [README](README.md) 和 [学习记录](docs/learning-progress.md)。
+已补积压背压、投递历史/分页及失败重放，并在隔离 MySQL/Redis 下验证事务原子性、并发容量与重放、旧轮次隔离和 HTTP 重放闭环。Retry-After、退避、HMAC 与接收端事务性持久化幂等均已在隔离 MySQL 8.4/Redis 7.4 中验证，包括处理成功但响应超时后的重投。新增 `scripts/test-integration.sh` 可一键创建并清理隔离测试环境，不读取用户 `.env`。单 Worker 内端点并发限制和慢端点隔离测试也已完成；满额任务在领取前通过 Asynq 延迟替换，保留业务 ID 和剩余普通重试预算。已补执行租约等待、取消后的限时结果回写、数据库重试等待约束，以及独立 Reconciler。新增平台迁移 `000006_add_delivery_recovery.up.sql` 仅在隔离库验证，用户开发库尚未导入。延期任务 ID 会落库供对账；恢复通过新 generation + Outbox 保留业务尝试次数，预算耗尽则失败。已验证单任务丢失/归档、存活延期跳过、Outbox 回滚、旧结果隔离和预算限制；完整 Redis 清空、Worker 强杀恢复时间及多实例故障尚未验证，不能宣称完整可靠版本。下一步优先基础指标。最新运行步骤与验证边界见 [README](README.md) 和 [学习记录](docs/learning-progress.md)。

@@ -1,7 +1,7 @@
 # 学习进度与下次起点
 
 > 已完成接收端创建→查询及 PATCH 启用/禁用的真实 HTTP + MySQL 验证（用户反馈通过）。
-> 当前已实现 Outbox、背压、尝试历史、失败重放、HTTP 重试、HMAC 及接收端事务性持久化幂等。Docker 本轮已恢复，重试/签名/超时重投已通过隔离 MySQL 8.4/Redis 7.4 验证。平台五份迁移勿重复导入；**新增接收端迁移 `migrations/receiver/000001_create_receipts.up.sql` 只应用到独立接收端数据库，目前仅在隔离测试库执行，用户环境待配置。** Receiver 需要 `RECEIVER_SIGNING_SECRET` 和 `RECEIVER_MYSQL_*`。单 Worker 端点并发限制与慢端点隔离也已实现并验证；默认总并发 4、每端点 1。下一步 Worker 强杀恢复验证。
+> 当前已实现 Outbox、背压、尝试历史、失败重放、HTTP 重试、HMAC 及接收端事务性持久化幂等。Docker 本轮已恢复，重试/签名/超时重投已通过隔离 MySQL 8.4/Redis 7.4 验证。平台五份迁移勿重复导入；**新增接收端迁移 `migrations/receiver/000001_create_receipts.up.sql` 只应用到独立接收端数据库，目前仅在隔离测试库执行，用户环境待配置。** Receiver 需要 `RECEIVER_SIGNING_SECRET` 和 `RECEIVER_MYSQL_*`。单 Worker 端点并发限制与慢端点隔离也已实现并验证；默认总并发 4、每端点 1。**最新：已实现保守自动对账，新增平台 `000006_add_delivery_recovery.up.sql` 只在隔离测试库执行，开发库尚未执行；升级前须补该迁移，再运行 `cmd/reconciler`。** 单任务丢失/归档恢复已验证，强杀及完整 Redis 清空仍未验证。
 
 ## 辅导方式与协作约定
 
@@ -300,6 +300,22 @@ git diff --check
 - 边界：单进程配额会随多个 Worker 叠加；同 URL 不同端点也各自有配额。远端在本地超时后可能继续执行。大量热端点仍可能反复延期，无严格公平或最长等待保证；Redis 延期入队失败走普通重试，耗尽后可能遗留非终态记录。发布成功、旧任务确认前崩溃可能重复；仍需业务幂等。未来 Reconciler 不能只查初始稳定队列 ID 判断任务是否丢失。
 - 下一步 Worker 强杀实验：记录 Asynq 恢复等待时间、数据库租约与未完成历史，再推进 Redis 丢数据对账与指标。
 
+## Worker 核心补强：租约等待、取消回写与重试等待
+
+- 租约占用不再直接消耗普通队列重试；先延期入队，成功后才确认原任务。HTTP 保留取消传播，结果回写使用独立 5 秒限时上下文，原有 generation/attempt_count 条件更新不变。
+- 重试退避只计算一次，数据库与 Asynq 共用该值。复用 `deliveries.lease_until`：processing 为执行租约，retrying 为最早重试时间；终态清空。重复任务和秒级取整引起的提前领取只能延期，不能提前发送或消耗业务预算。仍由 Asynq 调度，没有新增数据库调度器。
+- 不增加迁移，不改开发库；旧 retrying 记录不补算等待时间，更新后重启 Worker 生效。修改 `Finish` 的调用处主要是补传重试延迟，非重试结果传 0。
+- 按用户要求仅做关键验证：delivery/task 单测、全项目构建、相关包 vet 通过；隔离 MySQL 8.4/Redis 7.4 下运行 `TestDeliveryWorkIntegration` 与 `TestAsyncDelivery/(rate-limited|exhausted)` 通过，临时容器已清理。本轮未跑完整故障矩阵或强杀实验。
+- 边界：时间检查依赖 Worker 时钟同步；写库失败无法保证本次等待已持久化。当时自动对账尚未实现，后续实现见下一节；跨进程配额仍未实现。
+
+## 保守自动对账恢复（当前最新）
+
+- 新增 `cmd/reconciler`、`internal/reconcile` 和存储恢复事务。默认宽限 5 分钟，每 30 秒扫 100 条，最多自动恢复 3 次。扫描用 ID 游标；未发布 Outbox、活跃租约/重试等待、近期活动及队列中仍存活的任务不恢复，Redis 查询错误不视作丢失。
+- Worker 延期入队后先落库队列任务 ID，再确认原任务。当前 generation 的 Outbox 已发布且 tracked task 明确缺失/归档/完成时，短事务重验快照 → generation+1、recovery_count+1、pending → 新 Outbox。Redis 检查不持有数据库事务。自动恢复不重置 attempt_count，旧结果只允许补自身历史；耗尽业务或恢复预算则 failed，人工重放才重置两种预算。
+- **新增平台迁移 `migrations/000006_add_delivery_recovery.up.sql`：queue_task_id、recovery_count 与扫描索引。开发库尚未导入，也未启停用户服务。** 新版 API/Worker 同样依赖这份迁移；请按 README 停旧进程、只补 000006、启动新版进程。Receiver 独立迁移要求不变。
+- 本轮聚焦一个 `TestRecovery` 集成场景：隔离 MySQL 8.4/Redis 7.4 下删除已发布任务，恢复后完成真实 HTTP；同时验证跟踪延期 ID、存活任务跳过、归档恢复、快照过时、查询错误不恢复、Outbox 写入失败回滚、晚到结果、两种预算与人工重放清零。既有 429/耗尽队列场景也通过；未跑完整故障矩阵。测试容器已清理。
+- 保存的是最近已知队列 ID，不是所有重复任务的完整索引；入队与记录间崩溃、升级前延期任务等仍可能触发替换一个尚存的旧任务。执行版本隔离不撤回外部 HTTP，接收端仍须幂等。队列仍标为 active 的任务不强行接管。完整 Redis 清空、强杀等待时间和多实例故障仍待验证；下一步基础指标。
+
 ## 下次恢复环境
 
 在项目根目录执行：
@@ -323,11 +339,13 @@ export MAX_PENDING_DELIVERIES="${MAX_PENDING_DELIVERIES:-10000}"
 export WORKER_CONCURRENCY="${WORKER_CONCURRENCY:-4}"
 export ENDPOINT_CONCURRENCY="${ENDPOINT_CONCURRENCY:-1}"
 
-# 000001..000005 均已完成，不要重复执行迁移。
+# 000001..000005 均已完成，不要重复执行。
+# 升级本轮代码前，先按 README 只补新增 000006（开发库尚未执行）。
 go run ./cmd/api
 # 另外三个终端（Worker/Dispatcher 也需加载上述环境）：
 # go run ./cmd/dispatcher
 # go run ./cmd/worker
+# go run ./cmd/reconciler  # 可选恢复进程，须先迁移并更新 Worker
 # Receiver 首次升级需按 README 创建独立库/用户并执行接收端迁移。
 # 本终端需导出 RECEIVER_MYSQL_*，特别是独立库密码（不继承 MYSQL_*）。
 # 然后设置对应端点一次性交付的 signing_secret：
@@ -340,7 +358,7 @@ go run ./cmd/api
 - `cmd/api` 还要求 `ALLOWED_ENDPOINT_URL`（例如本地开发用 `http://127.0.0.1:9090/webhook`）；不要把真实密钥贴到对话中。
 - `cmd/api` 和 `cmd/healthcheck` 默认都监听 8080，不要同时启动。
 - 先用 `/healthz`、`/readyz` 检查服务；若 HTTP_ADDR 已修改，使用实际地址。
-- 不要重复执行已应用的 CREATE TABLE。平台五份迁移已应用；接收端独立迁移目前仅在测试库验证，用户环境仍需按 README 首次配置。若数据库卷改变或表缺失，先确认数据库和迁移状态，不通过删表或 AutoMigrate 绕过问题。
+- 不要重复执行已应用的 CREATE TABLE。平台前五份迁移已应用，新增 000006 仍待用户导入；接收端独立迁移目前仅在测试库验证，用户环境仍需按 README 首次配置。若数据库卷改变或表缺失，先确认数据库和迁移状态，不通过删表或 AutoMigrate 绕过问题。
 - 若执行集成测试，需数据库运行、迁移已应用，且当前终端已导出数据库配置：
 
 ```bash

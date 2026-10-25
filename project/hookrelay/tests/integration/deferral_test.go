@@ -64,7 +64,8 @@ func TestDeferralPreservesRemainingRetries(t *testing.T) {
 			return asynq.SkipRetry
 		}
 		if step == 2 || step == 4 {
-			return deferrer.DeferDelivery(ctx, p.DeliveryID, p.Generation)
+			_, err := deferrer.DeferDelivery(ctx, p.DeliveryID, p.Generation)
+			return err
 		}
 		return errors.New("injected ordinary failure")
 	})

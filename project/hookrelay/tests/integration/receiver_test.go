@@ -98,12 +98,13 @@ func TestReceiverTimeoutDeduplication(t *testing.T) {
 	defer inspector.DeleteQueue(queue, true)
 	deferrer := task.NewClient(cfg.RedisAddr)
 	defer deferrer.Close()
+	retryPolicy := delivery.RetryPolicy{BaseDelay: 100 * time.Millisecond, MaxDelay: time.Second}
 	worker := delivery.Worker{Store: store.DeliveryStore{DB: db}, Send: delivery.NewSender(time.Second).Send, AllowedURL: endpoint.URL,
-		Limiter: delivery.NewEndpointLimiter(1), Defer: deferrer.DeferDelivery}
+		Limiter: delivery.NewEndpointLimiter(1), Defer: deferrer.DeferDelivery, RetryPolicy: retryPolicy}
 	jobs := asynq.NewServer(redis, asynq.Config{
 		Concurrency: 4, Queues: map[string]int{queue: 1}, TaskCheckInterval: 50 * time.Millisecond,
 		DelayedTaskCheckInterval: 100 * time.Millisecond, ShutdownTimeout: 3 * time.Second,
-		RetryDelayFunc: (delivery.RetryPolicy{BaseDelay: 100 * time.Millisecond, MaxDelay: time.Second}).Delay,
+		RetryDelayFunc: retryPolicy.Delay,
 	})
 	mux := asynq.NewServeMux()
 	mux.Handle(task.TypeDelivery, worker)

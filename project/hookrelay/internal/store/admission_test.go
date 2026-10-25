@@ -136,7 +136,7 @@ func TestAdmissionIntegration(t *testing.T) {
 	if _, err := CreateOrGetEventDelivery(ctx, db, inputs[rejected], 1); !errors.Is(err, ErrBacklogFull) {
 		t.Fatal("processing must count toward backlog")
 	}
-	if err := repo.Finish(ctx, work, "retrying", 500, "http_error", time.Millisecond); err != nil {
+	if err := repo.Finish(ctx, work, "retrying", 500, "http_error", time.Millisecond, 0); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := CreateOrGetEventDelivery(ctx, db, inputs[rejected], 1); !errors.Is(err, ErrBacklogFull) {
@@ -146,7 +146,7 @@ func TestAdmissionIntegration(t *testing.T) {
 	if err != nil || work == nil {
 		t.Fatal("retry claim failed")
 	}
-	if err := repo.Finish(ctx, work, "succeeded", 204, "", time.Millisecond); err != nil {
+	if err := repo.Finish(ctx, work, "succeeded", 204, "", time.Millisecond, 0); err != nil {
 		t.Fatal(err)
 	}
 	next, err := CreateOrGetEventDelivery(ctx, db, inputs[rejected], 1)
@@ -157,7 +157,7 @@ func TestAdmissionIntegration(t *testing.T) {
 	if err != nil || work == nil {
 		t.Fatal("second claim failed")
 	}
-	if err := repo.Finish(ctx, work, "failed", 400, "http_error", time.Millisecond); err != nil {
+	if err := repo.Finish(ctx, work, "failed", 400, "http_error", time.Millisecond, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -183,7 +183,7 @@ func TestAdmissionIntegration(t *testing.T) {
 	if err != nil || work == nil {
 		t.Fatal("third claim failed")
 	}
-	if err := repo.Finish(ctx, work, "succeeded", 204, "", time.Millisecond); err != nil {
+	if err := repo.Finish(ctx, work, "succeeded", 204, "", time.Millisecond, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -216,7 +216,7 @@ func TestAdmissionIntegration(t *testing.T) {
 	if err != nil || work == nil {
 		t.Fatal("last claim failed")
 	}
-	if err := repo.Finish(ctx, work, "succeeded", 204, "", time.Millisecond); err != nil {
+	if err := repo.Finish(ctx, work, "succeeded", 204, "", time.Millisecond, 0); err != nil {
 		t.Fatal(err)
 	}
 

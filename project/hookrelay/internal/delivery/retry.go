@@ -16,12 +16,14 @@ import (
 type retryError struct {
 	after   string
 	message string
-	attempt uint32 // DB attempt number survives replacement queue task IDs.
+	attempt uint32        // DB attempt number survives replacement queue task IDs.
+	delay   time.Duration // Selected once, shared by the DB cooldown and Asynq.
 }
 
 func (e *retryError) Error() string { return e.message }
 
-// Configuration validates 0 < BaseDelay <= MaxDelay.
+// Configuration validates 0 < BaseDelay <= MaxDelay. The zero value uses the
+// default 5s base / 1m cap, including Workers constructed outside cmd/worker.
 type RetryPolicy struct {
 	BaseDelay time.Duration
 	MaxDelay  time.Duration
@@ -34,8 +36,16 @@ type RetryPolicy struct {
 // ceiling. A valid Retry-After can extend it, but never beyond MaxDelay.
 func (p RetryPolicy) Delay(n int, err error, _ *asynq.Task) time.Duration {
 	var retry *retryError
-	if errors.As(err, &retry) && retry.attempt > 0 {
-		n = int(retry.attempt - 1)
+	if errors.As(err, &retry) {
+		if retry.delay > 0 {
+			return retry.delay // Do not draw jitter or parse Retry-After twice.
+		}
+		if retry.attempt > 0 {
+			n = int(retry.attempt - 1)
+		}
+	}
+	if p == (RetryPolicy{}) {
+		p = RetryPolicy{BaseDelay: 5 * time.Second, MaxDelay: time.Minute}
 	}
 	ceiling := p.BaseDelay
 	for i := 0; i < n && ceiling < p.MaxDelay; i++ {

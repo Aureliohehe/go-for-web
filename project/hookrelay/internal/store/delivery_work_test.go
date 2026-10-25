@@ -92,28 +92,43 @@ func TestDeliveryWorkIntegration(t *testing.T) {
 	}
 	invalid := *work
 	invalid.AttemptID = ^uint64(0)
-	if err := repo.Finish(ctx, &invalid, "succeeded", 200, "", time.Millisecond); err == nil {
+	if err := repo.Finish(ctx, &invalid, "succeeded", 200, "", time.Millisecond, 0); err == nil {
 		t.Fatal("missing history must fail finish")
 	}
 	unchanged, err = FindDelivery(ctx, db, first.DeliveryID)
 	if err != nil || unchanged.Status != "processing" {
 		t.Fatal("history update failure must roll back delivery result")
 	}
-	if err := repo.Finish(ctx, work, "retrying", 500, "http_error", 25*time.Millisecond); err != nil {
+	if err := repo.Finish(ctx, work, "retrying", 500, "http_error", 25*time.Millisecond, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	cooling, err := FindDelivery(ctx, db, first.DeliveryID)
+	if err != nil || cooling.Status != "retrying" || cooling.LeaseUntil == nil || !cooling.LeaseUntil.After(time.Now()) {
+		t.Fatal("retry cooldown was not persisted")
+	}
+	if _, err := repo.Claim(ctx, first.DeliveryID, 1, 3, time.Minute); !errors.Is(err, ErrDeliveryBusy) {
+		t.Fatal("duplicate task bypassed retry cooldown")
+	}
+	if rows, err := ListDeliveryAttempts(ctx, db, first.DeliveryID, 0, 20); err != nil || len(rows) != 1 {
+		t.Fatal("cooldown wait created an extra attempt")
+	}
+	// Advance the durable gate instead of sleeping for the retry delay.
+	if err := db.Model(&Delivery{}).Where("id = ?", first.DeliveryID).
+		Update("lease_until", time.Now().UTC().Add(-time.Second)).Error; err != nil {
 		t.Fatal(err)
 	}
 	next, err := repo.Claim(ctx, first.DeliveryID, 1, 3, time.Minute)
 	if err != nil || next == nil || next.Delivery.AttemptCount != 2 {
 		t.Fatal("retry must increment attempt count")
 	}
-	if err := repo.Finish(ctx, work, "succeeded", 200, "", time.Millisecond); err != nil {
+	if err := repo.Finish(ctx, work, "succeeded", 200, "", time.Millisecond, 0); err != nil {
 		t.Fatal(err)
 	}
 	current, err := FindDelivery(ctx, db, first.DeliveryID)
 	if err != nil || current.Status != "processing" {
 		t.Fatal("old attempt overwrote current state")
 	}
-	if err := repo.Finish(ctx, next, "succeeded", 204, "", 12*time.Millisecond); err != nil {
+	if err := repo.Finish(ctx, next, "succeeded", 204, "", 12*time.Millisecond, 0); err != nil {
 		t.Fatal(err)
 	}
 	current, err = FindDelivery(ctx, db, first.DeliveryID)
@@ -165,7 +180,7 @@ func TestDeliveryWorkIntegration(t *testing.T) {
 	if err != nil || newer == nil {
 		t.Fatal("new claim failed")
 	}
-	if err := repo.Finish(ctx, old, "succeeded", 200, "", 7*time.Millisecond); err != nil {
+	if err := repo.Finish(ctx, old, "succeeded", 200, "", 7*time.Millisecond, 0); err != nil {
 		t.Fatal(err)
 	}
 	current, err = FindDelivery(ctx, db, late.DeliveryID)
@@ -176,7 +191,7 @@ func TestDeliveryWorkIntegration(t *testing.T) {
 	if err != nil || len(rows) != 2 || rows[0].Status != "succeeded" || rows[0].FinishedAt == nil || rows[1].FinishedAt != nil {
 		t.Fatal("late result must only finish its own history")
 	}
-	if err := repo.Finish(ctx, newer, "failed", 0, "network_error", 9*time.Millisecond); err != nil {
+	if err := repo.Finish(ctx, newer, "failed", 0, "network_error", 9*time.Millisecond, 0); err != nil {
 		t.Fatal(err)
 	}
 	rows, err = ListDeliveryAttempts(ctx, db, late.DeliveryID, old.AttemptID, 20)

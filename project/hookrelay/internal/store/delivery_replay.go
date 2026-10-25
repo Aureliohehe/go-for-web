@@ -39,7 +39,7 @@ func replayDelivery(ctx context.Context, db *gorm.DB, id uint64, maxPending int6
 		if err != nil {
 			return err
 		}
-		if d.Status != "failed" {
+		if d.Status != "failed" || d.Generation == ^uint32(0) {
 			return ErrDeliveryNotReplayable
 		}
 
@@ -63,6 +63,7 @@ func replayDelivery(ctx context.Context, db *gorm.DB, id uint64, maxPending int6
 		updated := tx.Model(&Delivery{}).Where("id = ? AND status = 'failed' AND generation = ?", id, d.Generation).
 			Updates(map[string]any{
 				"status": "pending", "generation": d.Generation + 1, "attempt_count": 0,
+				"queue_task_id": "", "recovery_count": 0,
 				"last_http_status": nil, "last_error": nil, "lease_until": nil, "updated_at": now,
 			})
 		if updated.Error != nil {
@@ -73,6 +74,7 @@ func replayDelivery(ctx context.Context, db *gorm.DB, id uint64, maxPending int6
 		}
 		d.Generation++
 		d.Status, d.AttemptCount = "pending", 0
+		d.QueueTaskID, d.RecoveryCount = "", 0
 		d.LastHTTPStatus, d.LastError, d.LeaseUntil = nil, nil, nil
 		d.UpdatedAt = now
 		entry := Outbox{DeliveryID: d.ID, Generation: d.Generation, Status: "pending", AvailableAt: now, CreatedAt: now, UpdatedAt: now}
