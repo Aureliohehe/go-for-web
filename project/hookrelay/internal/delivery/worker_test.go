@@ -8,6 +8,7 @@ import (
 
 	"github.com/aurelio/hookrelay/internal/store"
 	"github.com/aurelio/hookrelay/internal/task"
+	"github.com/aurelio/hookrelay/internal/webhook"
 	"github.com/hibiken/asynq"
 )
 
@@ -18,6 +19,12 @@ type testRepository struct {
 	httpStatus          int
 	latency             time.Duration
 	claims, finishes    int
+	endpointID          uint64
+	lookupErr           error
+}
+
+func (r *testRepository) EndpointID(context.Context, uint64, uint32) (uint64, error) {
+	return r.endpointID, r.lookupErr
 }
 
 func (r *testRepository) Claim(_ context.Context, id uint64, gen uint32, max uint32, lease time.Duration) (*store.DeliveryWork, error) {
@@ -44,6 +51,7 @@ func TestWorker(t *testing.T) {
 		{name: "temporary error", status: "retrying", code: 500, retryable: true, sendErr: ErrHTTPStatus, attempt: 1, wantErr: true},
 		{name: "timeout", status: "retrying", retryable: true, sendErr: context.DeadlineExceeded, attempt: 1, wantErr: true},
 		{name: "canceled", status: "retrying", retryable: true, sendErr: context.Canceled, attempt: 1, wantErr: true},
+		{name: "invalid secret", status: "failed", sendErr: webhook.ErrInvalidSecret, attempt: 1, wantErr: true, skipRetry: true},
 		{name: "permanent error", status: "failed", code: 400, sendErr: ErrHTTPStatus, attempt: 1, wantErr: true, skipRetry: true},
 		{name: "budget exhausted", status: "failed", code: 500, retryable: true, sendErr: ErrHTTPStatus, attempt: task.MaxAttempts, wantErr: true, skipRetry: true},
 		{name: "terminal skips send", terminal: true},
@@ -59,13 +67,13 @@ func TestWorker(t *testing.T) {
 				repo.work = &store.DeliveryWork{
 					Delivery: store.Delivery{ID: 9, Generation: 1, AttemptCount: tt.attempt},
 					Event:    store.Event{ID: 7, Payload: []byte(`{ "id": 1 }`)},
-					Endpoint: store.Endpoint{URL: "http://receiver/webhook"},
+					Endpoint: store.Endpoint{URL: "http://receiver/webhook", SigningSecret: testSigningSecret},
 				}
 			}
 			sends := 0
 			worker := Worker{Store: repo, AllowedURL: "http://receiver/webhook", Send: func(_ context.Context, req Request) (Result, error) {
 				sends++
-				if req.DeliveryID != "9" || req.URL != "http://receiver/webhook" || string(req.Payload) != `{ "id": 1 }` {
+				if req.DeliveryID != "9" || req.URL != "http://receiver/webhook" || string(req.Payload) != `{ "id": 1 }` || req.SigningSecret != testSigningSecret {
 					t.Fatal("wrong sender input")
 				}
 				return Result{HTTPStatus: tt.code, Retryable: tt.retryable, RetryAfter: "20", Latency: 12 * time.Millisecond}, tt.sendErr
@@ -82,8 +90,8 @@ func TestWorker(t *testing.T) {
 			if errors.As(err, &retry) != wantHint {
 				t.Fatal("retry metadata did not match result")
 			}
-			if wantHint && retry.after != "20" {
-				t.Fatal("Retry-After lost between Sender and queue")
+			if wantHint && (retry.after != "20" || retry.attempt != tt.attempt) {
+				t.Fatal("retry metadata lost between Sender and queue")
 			}
 			wantSends := 1
 			if tt.terminal || tt.claimErr != nil || tt.disallowed {
@@ -94,6 +102,9 @@ func TestWorker(t *testing.T) {
 			}
 			if tt.name == "canceled" && repo.reason != "canceled" {
 				t.Fatal("cancellation must be classified")
+			}
+			if tt.name == "invalid secret" && repo.reason != "signing_error" {
+				t.Fatal("signing failure must be classified")
 			}
 			if tt.name == "timeout" && repo.reason != "timeout" {
 				t.Fatal("timeout must be classified")

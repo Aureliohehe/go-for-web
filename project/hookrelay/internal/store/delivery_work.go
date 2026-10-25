@@ -20,6 +20,22 @@ type DeliveryWork struct {
 
 type DeliveryStore struct{ DB *gorm.DB }
 
+// EndpointID is a read-only preflight for the process-local limiter. It does not
+// claim work or consume an attempt. Events' endpoint IDs are immutable; Claim
+// still rechecks generation, terminal state, enabled state and lease under lock.
+// Zero means missing, terminal or stale work and can be acknowledged immediately.
+func (s DeliveryStore) EndpointID(ctx context.Context, id uint64, generation uint32) (uint64, error) {
+	var row struct{ EndpointID uint64 }
+	err := s.DB.WithContext(ctx).Table("deliveries AS d").
+		Select("e.endpoint_id").Joins("JOIN events AS e ON e.id = d.event_id").
+		Where("d.id = ? AND d.generation = ? AND d.status IN ?", id, generation, []string{"pending", "processing", "retrying"}).
+		Take(&row).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return 0, nil
+	}
+	return row.EndpointID, err
+}
+
 // Claim holds a row lock only during database work, never during HTTP.
 // A nil work item means terminal, missing, stale generation or budget exhausted.
 func (s DeliveryStore) Claim(ctx context.Context, id uint64, generation uint32, maxAttempts uint32, lease time.Duration) (*DeliveryWork, error) {

@@ -16,6 +16,7 @@ import (
 type retryError struct {
 	after   string
 	message string
+	attempt uint32 // DB attempt number survives replacement queue task IDs.
 }
 
 func (e *retryError) Error() string { return e.message }
@@ -26,10 +27,16 @@ type RetryPolicy struct {
 	MaxDelay  time.Duration
 }
 
-// Delay implements asynq.RetryDelayFunc. n is zero for the first retry.
+// Delay implements asynq.RetryDelayFunc. For HTTP results use the durable attempt
+// number, so endpoint deferral cannot reset backoff. Infrastructure errors fall
+// back to Asynq's n (zero for the first retry of the current queue task).
 // Equal jitter keeps the delay between half the exponential ceiling and the
 // ceiling. A valid Retry-After can extend it, but never beyond MaxDelay.
 func (p RetryPolicy) Delay(n int, err error, _ *asynq.Task) time.Duration {
+	var retry *retryError
+	if errors.As(err, &retry) && retry.attempt > 0 {
+		n = int(retry.attempt - 1)
+	}
 	ceiling := p.BaseDelay
 	for i := 0; i < n && ceiling < p.MaxDelay; i++ {
 		if ceiling > p.MaxDelay/2 {
@@ -40,8 +47,7 @@ func (p RetryPolicy) Delay(n int, err error, _ *asynq.Task) time.Duration {
 	}
 	half := ceiling / 2
 	delay := ceiling - half + time.Duration(rand.Int64N(int64(half)+1))
-	var retry *retryError
-	if errors.As(err, &retry) {
+	if retry != nil {
 		if hint := parseRetryAfter(retry.after, time.Now(), p.MaxDelay); hint > delay {
 			delay = hint
 		}

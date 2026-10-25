@@ -94,6 +94,18 @@ func TestRetryPolicyBoundaryDelays(t *testing.T) {
 	}
 }
 
+func TestRetryPolicyUsesDurableAttempt(t *testing.T) {
+	p := RetryPolicy{BaseDelay: 4 * time.Second, MaxDelay: 32 * time.Second}
+	// Queue retry count restarts at zero after deferral, but this is still the
+	// second HTTP attempt. Its ceiling must be 8s, not the first attempt's 4s.
+	for range 100 {
+		got := p.Delay(0, &retryError{message: "HTTP failure", attempt: 2}, nil)
+		if got < 4*time.Second || got > 8*time.Second {
+			t.Fatalf("backoff reset after deferral: %v", got)
+		}
+	}
+}
+
 func TestRetryPolicyHint(t *testing.T) {
 	p := RetryPolicy{BaseDelay: 4 * time.Second, MaxDelay: 32 * time.Second}
 	for _, tt := range []struct {

@@ -21,6 +21,7 @@ import (
 	"github.com/aurelio/hookrelay/internal/outbox"
 	"github.com/aurelio/hookrelay/internal/store"
 	"github.com/aurelio/hookrelay/internal/task"
+	"github.com/aurelio/hookrelay/internal/webhook"
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
 )
@@ -65,6 +66,12 @@ func TestAsyncDelivery(t *testing.T) {
 	retryDelays := map[uint64][]time.Duration{}
 	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
+		if err := webhook.Verify(strings.Repeat("a", 64), r.Header.Get(webhook.HeaderID),
+			r.Header.Get(webhook.HeaderTimestamp), r.Header.Get(webhook.HeaderSignature), body, time.Now()); err != nil {
+			t.Error("invalid signature from queued delivery")
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
 		mu.Lock()
 		counts[string(body)]++
 		if previous := deliveryIDs[string(body)]; previous != "" && previous != r.Header.Get("X-Webhook-ID") {
@@ -165,10 +172,13 @@ func TestAsyncDelivery(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	worker := delivery.Worker{Store: store.DeliveryStore{DB: db}, Send: delivery.NewSender(time.Second).Send, AllowedURL: receiver.URL}
+	deferrer := task.NewClient(cfg.RedisAddr)
+	defer deferrer.Close()
+	worker := delivery.Worker{Store: store.DeliveryStore{DB: db}, Send: delivery.NewSender(time.Second).Send, AllowedURL: receiver.URL,
+		Limiter: delivery.NewEndpointLimiter(1), Defer: deferrer.DeferDelivery}
 	retryPolicy := delivery.RetryPolicy{BaseDelay: 100 * time.Millisecond, MaxDelay: 2 * time.Second}
 	server := asynq.NewServer(redis, asynq.Config{
-		Concurrency: 1, Queues: map[string]int{queue: 1},
+		Concurrency: 4, Queues: map[string]int{queue: 1},
 		TaskCheckInterval: 50 * time.Millisecond, DelayedTaskCheckInterval: 100 * time.Millisecond,
 		RetryDelayFunc: func(n int, err error, job *asynq.Task) time.Duration {
 			delay := retryPolicy.Delay(n, err, job)

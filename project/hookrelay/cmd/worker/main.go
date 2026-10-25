@@ -31,6 +31,10 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	limits, err := config.LoadWorkerLimits()
+	if err != nil {
+		return err
+	}
 	if cfg.AllowedEndpointURL == "" {
 		return fmt.Errorf("ALLOWED_ENDPOINT_URL is required")
 	}
@@ -42,10 +46,15 @@ func run(ctx context.Context) error {
 	}
 	defer pool.Close()
 
-	worker := delivery.Worker{Store: store.DeliveryStore{DB: db}, Send: delivery.NewSender(task.HTTPTimeout).Send, AllowedURL: cfg.AllowedEndpointURL}
+	client := task.NewClient(cfg.RedisAddr)
+	defer client.Close()
+	worker := delivery.Worker{
+		Store: store.DeliveryStore{DB: db}, Send: delivery.NewSender(task.HTTPTimeout).Send, AllowedURL: cfg.AllowedEndpointURL,
+		Limiter: delivery.NewEndpointLimiter(limits.EndpointConcurrency), Defer: client.DeferDelivery,
+	}
 	retryPolicy := delivery.RetryPolicy{BaseDelay: cfg.RetryBaseDelay, MaxDelay: cfg.RetryMaxDelay}
 	server := asynq.NewServer(asynq.RedisClientOpt{Addr: cfg.RedisAddr}, asynq.Config{
-		Concurrency:     1,
+		Concurrency:     limits.Concurrency,
 		Queues:          map[string]int{task.Queue: 1},
 		ShutdownTimeout: 25 * time.Second,
 		RetryDelayFunc:  retryPolicy.Delay,
@@ -55,7 +64,11 @@ func run(ctx context.Context) error {
 	if err := server.Start(mux); err != nil {
 		return err
 	}
-	slog.Info("worker started", "retry_base_delay", cfg.RetryBaseDelay, "retry_max_delay", cfg.RetryMaxDelay)
+	slog.Info("worker started", "retry_base_delay", cfg.RetryBaseDelay, "retry_max_delay", cfg.RetryMaxDelay,
+		"concurrency", limits.Concurrency, "endpoint_concurrency", limits.EndpointConcurrency)
+	if limits.EndpointConcurrency == limits.Concurrency {
+		slog.Warn("one endpoint can occupy every worker slot; no spare capacity for other endpoints")
+	}
 	<-ctx.Done()
 	server.Shutdown()
 	return nil

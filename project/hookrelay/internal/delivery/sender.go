@@ -7,14 +7,17 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"github.com/aurelio/hookrelay/internal/webhook"
 )
 
 var ErrHTTPStatus = errors.New("receiver returned non-2xx status")
 
 type Request struct {
-	URL        string
-	DeliveryID string
-	Payload    []byte
+	URL           string
+	DeliveryID    string
+	SigningSecret string `json:"-"`
+	Payload       []byte
 }
 
 type Result struct {
@@ -24,7 +27,7 @@ type Result struct {
 	Latency    time.Duration
 }
 
-// Sender performs one attempt. Scheduling, persistence and signing are separate.
+// Sender signs and performs one attempt. Scheduling and persistence are separate.
 // URLs must come from operator-approved endpoints, not arbitrary user input.
 type Sender struct {
 	client *http.Client
@@ -48,8 +51,14 @@ func (s *Sender) Send(ctx context.Context, input Request) (result Result, err er
 	if err != nil {
 		return result, err
 	}
+	timestamp, signature, err := webhook.Sign(input.SigningSecret, input.DeliveryID, input.Payload, time.Now())
+	if err != nil {
+		return result, err // Invalid local signing configuration is not retryable.
+	}
 	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("X-Webhook-ID", input.DeliveryID)
+	request.Header.Set(webhook.HeaderID, input.DeliveryID)
+	request.Header.Set(webhook.HeaderTimestamp, timestamp)
+	request.Header.Set(webhook.HeaderSignature, signature)
 	response, err := s.client.Do(request)
 	if err != nil {
 		result.Retryable = true

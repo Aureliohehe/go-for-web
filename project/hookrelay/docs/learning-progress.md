@@ -1,7 +1,7 @@
 # 学习进度与下次起点
 
 > 已完成接收端创建→查询及 PATCH 启用/禁用的真实 HTTP + MySQL 验证（用户反馈通过）。
-> 当前已实现 Outbox、背压、尝试历史、失败重放及有上限的 HTTP 重试策略；五份迁移均已应用，本轮不新增表，勿重复导入。失败重放、容量竞争和旧 generation 隔离此前已在真实 MySQL/Redis 中验证。最新重试策略通过单测/vet/race，新增真实队列场景待验证，再进入 HMAC 与接收方幂等。
+> 当前已实现 Outbox、背压、尝试历史、失败重放、HTTP 重试、HMAC 及接收端事务性持久化幂等。Docker 本轮已恢复，重试/签名/超时重投已通过隔离 MySQL 8.4/Redis 7.4 验证。平台五份迁移勿重复导入；**新增接收端迁移 `migrations/receiver/000001_create_receipts.up.sql` 只应用到独立接收端数据库，目前仅在隔离测试库执行，用户环境待配置。** Receiver 需要 `RECEIVER_SIGNING_SECRET` 和 `RECEIVER_MYSQL_*`。单 Worker 端点并发限制与慢端点隔离也已实现并验证；默认总并发 4、每端点 1。下一步 Worker 强杀恢复验证。
 
 ## 辅导方式与协作约定
 
@@ -247,7 +247,7 @@ git diff --check
 - 未读取 `.env`、未修改用户数据库或启停用户已有服务；临时实例已清理，日志 `/tmp/hookrelay-replay-XhdMy6`。保留此前未提交的迁移确认文档改动，无自动提交/推送。
 - 下一步补接收方 Retry-After、有上限的指数退避和抖动，再进入 HMAC 与接收方幂等。
 
-## 最新进度：HTTP 重试策略
+## 此前进度：HTTP 重试策略
 
 - 接续工作区已有的未提交重试改动，没有覆盖其他改动、自动提交或操作用户服务。本轮未读取 `.env`，未操作业务数据库，无新迁移。
 - `internal/delivery/retry.go`：`RetryPolicy.Delay` 接入 Asynq，指数上界为 `min(base × 2^n, max)`（n 从 0 起），在上界的一半到全部之间抖动。配置 `RETRY_BASE_DELAY=5s`、`RETRY_MAX_DELAY=1m`，校验 `0 < base <= max`；每轮 3 次领取预算不变。
@@ -258,6 +258,47 @@ git diff --check
 - **本轮实际通过**：`go test -count=1 ./...`、`go vet ./...`、`go test -race -count=1 ./...`、`git diff --check`。未启用数据库/队列集成测试；当前 Docker 命令提示 WSL 集成不可用，因此不能声称新增场景已经通过真实 MySQL/Redis 验证，也不要覆盖此前用户反馈 Docker 可用的历史事实。
 - 调度边界：Asynq v0.25.1 将计划时间存为 Unix 秒，可能向下取整不足一秒；扫描、排队及租约也影响发送时间。配置是调度策略，不保证精确执行时间或严格 Retry-After 等待下限；超过 max 的建议会被截断。Dispatcher 发布退避与 API 背压建议不受此配置影响。
 - 下一步：在独立已迁移空测试库和 Redis 7.4 中运行 `HOOKRELAY_OUTBOX_INTEGRATION=1 go test -count=1 -race -v ./tests/integration`，不使用日常业务库或清空表。随后实现 HMAC，再做接收方持久化幂等。
+
+## 此前进度：HMAC 签名与接收端验签
+
+- 本轮从干净工作区继续；检查 Docker 后仍提示 WSL 集成不可用，因此上一轮重试队列验收继续保留为待完成，没有冒用宿主旧 Redis 或用户业务库验证。
+- 新增 `internal/webhook/signature.go`：签名输入为 `timestamp + "." + delivery_id + "." + 原始 payload`，HMAC-SHA256，头格式 `v1=<hex>`。密钥用创建端点时 64 字符 hex **解码后的 32 字节**；时间窗口为前后 5 分钟，常量时间比较摘要。
+- 执行链路：Worker 从已领取的 Endpoint 读取密钥 → Sender 每次发送前生成时间戳和签名 → Receiver 限量读取原始正文 → 检查唯一签名相关头、时间窗口和 HMAC → 才进入模拟延迟/状态码逻辑。密钥不进入队列 payload、日志或错误文本；非法本地密钥不发送 HTTP，Worker 记录 `signing_error` 并最终失败。
+- `cmd/receiver` 必须通过环境变量 `RECEIVER_SIGNING_SECRET` 配置对应端点密钥，缺省/格式错误拒绝启动，不提供无签名降级。验签失败 401、超 256 KiB 请求 413，读取超时 5 秒；`-status`、`-delay`、`-retry-after` 在验签成功后仍可使用。
+- 启动顺序更新见 README：先 API 并创建端点、保管一次性密钥，再配置 Receiver，最后提交事件。同一 Receiver 仅对应一个密钥；已有端点密钥未保存则创建新端点，不通过 GET 取回或让助手读取数据库密钥。
+- **实际通过**：`go test -count=1 ./...`、`go vet ./...`、`go test -race -count=1 ./...`、`git diff --check`。包含独立 Python 计算的协议向量、篡改 ID/正文/时间戳、原始 JSON 空白、过期/未来/边界、重复头、错误密钥、不发无签名 HTTP、真实本地 Sender→Receiver 成功/429/500/401 和请求体大小限制。
+- `tests/integration/async_test.go` 新增队列接收端验签断言，覆盖原有重试/重放链路，但**本轮未启用 MySQL/Redis 集成测试**。不能将本地 httptest 通过描述为真实队列签名验收。
+- 无新迁移，未读取 `.env`、修改用户数据库、启停已有服务，也未自动提交。签名不加密正文，不阻止时间窗口内重放；接收端仍无持久化幂等，平台仍无自动对账。
+- 下一步：接收端独立持久化去重记录与模拟业务写入，同一事务依赖 delivery_id 唯一约束；验证已处理但响应超时后重试仅产生一次业务效果。Docker 恢复后在隔离库补跑重试/签名队列测试。
+
+## 此前进度：接收方持久化幂等
+
+- 接续上一轮未提交的 HMAC 改动，无自动提交或覆盖用户修改。本轮 Docker 引擎 29.1.3 已可用，使用**本次新建**的隔离 MySQL 8.4/Redis 7.4 容器及两个测试库，未读取 `.env`、操作用户业务库或已有服务。
+- `internal/receiver/store.go`：验签后，单事务 INSERT `receiver_receipts`（delivery_id 主键 + 原始正文 SHA-256）和 `receiver_effects`（模拟业务写入）。并发靠唯一约束裁决，不先查再写；业务写入失败回滚 receipt。receipt 唯一冲突后退出失败事务，再查已提交记录，相同正文返回 duplicate，不同正文返回冲突。
+- `internal/receiver/handler.go`：验签→事务→响应；首次成功可延迟响应，重复请求立即 204；同 ID 不同正文 409、存储错误 503。非 2xx 故障模式在业务写入前拒绝，不落库。`-delay 8s` 现在表示首次业务提交后的响应延迟，专门演示“接收端处理了，但发送方以为失败”。
+- `cmd/receiver` 新增独立 DB 连接、启动时检查接收端表、优雅退出。`config.LoadReceiverDB()` 只读取 `RECEIVER_MYSQL_*`，不继承平台密码/数据库，默认库和用户为 `hookrelay_receiver`；接收端仍必须配置端点签名密钥。
+- 新增 **`migrations/receiver/000001_create_receipts.up.sql`**，不是平台 000006，不要导入 hookrelay 平台库。用户环境尚未执行，README 提供独立建库/用户/权限/导表步骤。已有平台五份迁移无需改动，不使用 AutoMigrate；DDL 部分失败需先检查，不删库重来。
+- 新增 `scripts/test-integration.sh`：不加载 `.env`，创建随机端口、随机测试密码的临时 MySQL/Redis 与两个空库，导入对应迁移；运行存储/API、容量、Receiver、真实队列 race 测试。退出时仅删除本次创建的容器与临时卷，日志保留。
+- **实际验证通过**：全包测试/vet/race；隔离数据库下 8 请求并发仅一次业务写入、并发不同正文一成功一冲突、第二次写入失败两表回滚、新连接池读取已提交记录。Receiver 存储测试连续 3 次通过。
+- **真实队列关键结果**：第一次签名请求已提交接收端事务，响应延迟 10 秒，Sender 1 秒超时；Asynq 重试相同 delivery_id，命中 receipt，立即 204；投递 succeeded/attempt_count=2，历史先 timeout/retrying 后 succeeded；2 次 HTTP、1 receipt、1 effect。测试使用缩短超时，不冒充生产默认参数。
+- 补跑上一轮 Retry-After 秒数/日期/超大值/非法及重复头、HMAC 队列验签、失败重放/旧轮次隔离、Outbox 恢复与背压全部通过。两次完整脚本运行均通过，最新日志 `/tmp/hookrelay-integration-LycOoP`；临时容器已清理。
+- 边界：去重状态来自 MySQL，没有内存缓存；本轮验证新连接池重读，不宣称已完成接收端进程强杀/数据库灾难恢复。去重记录不清理，单平台 delivery_id 命名空间；同事务只能保护数据库内模拟副作用，不能保证外部支付/邮件恰好一次。
+- 下一步单 Worker 进程内的端点并发配额（非阻塞获取）和慢端点影响测试；之后再做强杀恢复、Redis 丢数据对账与指标。
+
+## 最新进度：单 Worker 端点并发限制
+
+- 接续已有未提交的 HMAC/Receiver 代码，未覆盖或自动提交。本轮无新迁移，未读取 `.env`、修改用户业务库或启停已有服务；测试使用脚本新建的隔离 MySQL 8.4/Redis 7.4。
+- `internal/config/worker.go`：Worker 专用配置 `WORKER_CONCURRENCY=4`、`ENDPOINT_CONCURRENCY=1`，要求正整数且端点限额不超过总并发；两者相等时启动警告不留其他端点余量。API 背压上限不受影响。
+- `internal/delivery/limiter.go`：一个 Worker 共享一个按 endpoint_id 计数的进程内 limiter，TryAcquire 不等待容量，最后一个许可释放时删除空闲条目。`defer release()` 覆盖成功、DB 错误、取消和 panic。
+- 请求链路：`DeliveryStore.EndpointID` 只读预查非终态同 generation 的端点 ID → TryAcquire → 原有 Claim 事务重新校验并登记尝试 → HTTP → Finish → 释放许可。预查不写库，端点 ID 不可变；终态、旧 generation、缺失记录直接跳过。
+- 满额时通过 `task.Client.DeferDelivery` 发布 2～4 秒随机延迟的替代任务，再确认旧任务；不 Claim、不发 HTTP、不改变业务状态/attempt_count、不制造历史。队列任务 ID 需要更换，因为原任务仍处于 active；delivery_id/generation 不变，新任务只保留剩余普通重试次数。
+- 选择原因：实际阅读 Asynq v0.25.1 `processor.handleFailedMessage`，确认它先判断重试上限、再调用 IsFailure。因此单靠 `IsFailure=false` 不能保护最后一次满额机会。真实 Redis 测试覆盖 MaxRetry(0) 重复延期，以及普通失败→延期(max=1)→失败→延期(max=0)→最终失败归档，证明没有重置失败预算。
+- HTTP 重试元数据携带 DB attempt_count，`RetryPolicy.Delay` 使用 attempt_count-1 计算指数退避，避免更换队列 ID 重置 HTTP 退避；尚未领取的基础设施错误仍使用当前队列任务计数。接收方 Retry-After 的解析/上限不变。
+- **实际验证**：全包 test/race、vet、diff 检查通过；脚本完整回归存储/API/背压/Receiver/队列。既有队列测试现也使用并发 4 + limiter。新增测试验证并发许可、释放/异常、预查无副作用、满额不消耗尝试、错误入队不确认任务，以及重试预算继承。
+- **观测结果**：4 槽、每端点 1；慢端点 1 个挂起 HTTP + 6 个积压，另一个端点在约 **184ms 内已成功**（从后续入队到轮询观测成功且首次延期均完成的上界，不是基准测试）；慢请求随后继续等待重复延期，总 HTTP 延迟约 2.856s。释放后共 8 次 HTTP、每条投递只领取一次、慢端点峰值 1，无归档。测试使用同一受控 URL 的两个端点 ID，不是按主机隔离实验。
+- 最新完整日志 `/tmp/hookrelay-integration-79LMLJ`；测试容器已清理。复现：`bash scripts/test-integration.sh`。不需要用户重复迁移；上一轮 Receiver 独立库的首次配置要求仍未代为执行。
+- 边界：单进程配额会随多个 Worker 叠加；同 URL 不同端点也各自有配额。远端在本地超时后可能继续执行。大量热端点仍可能反复延期，无严格公平或最长等待保证；Redis 延期入队失败走普通重试，耗尽后可能遗留非终态记录。发布成功、旧任务确认前崩溃可能重复；仍需业务幂等。未来 Reconciler 不能只查初始稳定队列 ID 判断任务是否丢失。
+- 下一步 Worker 强杀实验：记录 Asynq 恢复等待时间、数据库租约与未完成历史，再推进 Redis 丢数据对账与指标。
 
 ## 下次恢复环境
 
@@ -279,12 +320,19 @@ fi
 export ALLOWED_ENDPOINT_URL="${ALLOWED_ENDPOINT_URL:-http://127.0.0.1:9090/webhook}"
 export REDIS_ADDR="${REDIS_ADDR:-127.0.0.1:16379}"
 export MAX_PENDING_DELIVERIES="${MAX_PENDING_DELIVERIES:-10000}"
+export WORKER_CONCURRENCY="${WORKER_CONCURRENCY:-4}"
+export ENDPOINT_CONCURRENCY="${ENDPOINT_CONCURRENCY:-1}"
 
 # 000001..000005 均已完成，不要重复执行迁移。
 go run ./cmd/api
 # 另外三个终端（Worker/Dispatcher 也需加载上述环境）：
 # go run ./cmd/dispatcher
 # go run ./cmd/worker
+# Receiver 首次升级需按 README 创建独立库/用户并执行接收端迁移。
+# 本终端需导出 RECEIVER_MYSQL_*，特别是独立库密码（不继承 MYSQL_*）。
+# 然后设置对应端点一次性交付的 signing_secret：
+# read -rsp 'Endpoint signing_secret: ' RECEIVER_SIGNING_SECRET; echo
+# export RECEIVER_SIGNING_SECRET
 # go run ./cmd/receiver
 ```
 
@@ -292,7 +340,7 @@ go run ./cmd/api
 - `cmd/api` 还要求 `ALLOWED_ENDPOINT_URL`（例如本地开发用 `http://127.0.0.1:9090/webhook`）；不要把真实密钥贴到对话中。
 - `cmd/api` 和 `cmd/healthcheck` 默认都监听 8080，不要同时启动。
 - 先用 `/healthz`、`/readyz` 检查服务；若 HTTP_ADDR 已修改，使用实际地址。
-- 不要重复执行已应用的 CREATE TABLE。若数据库卷改变或表缺失，先确认数据库和迁移状态，不通过删表或 AutoMigrate 绕过问题。
+- 不要重复执行已应用的 CREATE TABLE。平台五份迁移已应用；接收端独立迁移目前仅在测试库验证，用户环境仍需按 README 首次配置。若数据库卷改变或表缺失，先确认数据库和迁移状态，不通过删表或 AutoMigrate 绕过问题。
 - 若执行集成测试，需数据库运行、迁移已应用，且当前终端已导出数据库配置：
 
 ```bash

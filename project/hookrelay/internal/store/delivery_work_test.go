@@ -42,6 +42,18 @@ func TestDeliveryWorkIntegration(t *testing.T) {
 	}
 	repo := DeliveryStore{DB: db}
 	first := create()
+	if id, err := repo.EndpointID(ctx, first.DeliveryID, 1); err != nil || id != endpoint.ID {
+		t.Fatal("endpoint preflight failed")
+	}
+	if id, err := repo.EndpointID(ctx, first.DeliveryID, 2); err != nil || id != 0 {
+		t.Fatal("stale generation must skip preflight")
+	}
+	if id, err := repo.EndpointID(ctx, 0, 1); err != nil || id != 0 {
+		t.Fatal("missing delivery must skip preflight")
+	}
+	if d, err := FindDelivery(ctx, db, first.DeliveryID); err != nil || d.AttemptCount != 0 || d.Status != "pending" {
+		t.Fatal("preflight must not claim work")
+	}
 	if _, err := ListDeliveryAttempts(ctx, db, 0, 0, 20); !errors.Is(err, ErrDeliveryNotFound) {
 		t.Fatal("missing delivery must return not found")
 	}
@@ -107,6 +119,9 @@ func TestDeliveryWorkIntegration(t *testing.T) {
 	current, err = FindDelivery(ctx, db, first.DeliveryID)
 	if err != nil || current.Status != "succeeded" || current.LastHTTPStatus == nil || *current.LastHTTPStatus != 204 || current.LeaseUntil != nil {
 		t.Fatal("success was not saved")
+	}
+	if id, err := repo.EndpointID(ctx, first.DeliveryID, 1); err != nil || id != 0 {
+		t.Fatal("terminal delivery must skip preflight")
 	}
 	rows, err = ListDeliveryAttempts(ctx, db, first.DeliveryID, 0, 1)
 	if err != nil || len(rows) != 2 {
