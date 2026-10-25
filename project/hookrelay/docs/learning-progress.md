@@ -1,7 +1,7 @@
 # 学习进度与下次起点
 
 > 已完成接收端创建→查询及 PATCH 启用/禁用的真实 HTTP + MySQL 验证（用户反馈通过）。
-> 当前已实现 Outbox、背压、尝试历史和失败重放；五份迁移均已应用，本轮不新增表，勿重复导入。失败重放、容量竞争和旧 generation 隔离已在真实 MySQL/Redis 中验证。下一步完善 Retry-After、退避上限与抖动。
+> 当前已实现 Outbox、背压、尝试历史、失败重放及有上限的 HTTP 重试策略；五份迁移均已应用，本轮不新增表，勿重复导入。失败重放、容量竞争和旧 generation 隔离此前已在真实 MySQL/Redis 中验证。最新重试策略通过单测/vet/race，新增真实队列场景待验证，再进入 HMAC 与接收方幂等。
 
 ## 辅导方式与协作约定
 
@@ -235,7 +235,7 @@ git diff --check
 - 临时服务已清理，测试日志 `/tmp/hookrelay-history-cU2d99`。未读取 `.env`、未执行用户数据库迁移、未操作已有服务。
 - 下一步失败重放：容量接入锁→只允许 failed→generation+1→重置本轮预算→新 Outbox 同事务，保持 delivery_id，不删除历史。
 
-## 最新进度：失败重放
+## 此前进度：失败重放
 
 - 新增 `internal/store/delivery_replay.go`、`internal/handler/delivery_replay.go`，接入 `POST /v1/deliveries/:id/replay`，API Key 鉴权，无请求体。本轮无迁移，用户库已有 000001..000005 不要重复执行。
 - 同事务：接入锁→投递行锁→只允许 failed→检查端点 enabled 与容量→generation+1、重置本轮 attempt_count 和最后诊断/租约→写新 Outbox。不创建新 event/delivery，不删除历史，不直接访问 Redis。
@@ -246,6 +246,18 @@ git diff --check
 - 真实 HTTP + 队列测试：接收端第一次 400 → 原任务归档 → POST replay 返回 generation=2 → 人工注入旧 generation 队列任务被跳过 → 新 Outbox 发布 → 接收端 204 → 同一 delivery_id succeeded，历史同时保留两轮。重复 pending/succeeded 重放返回 409。
 - 未读取 `.env`、未修改用户数据库或启停用户已有服务；临时实例已清理，日志 `/tmp/hookrelay-replay-XhdMy6`。保留此前未提交的迁移确认文档改动，无自动提交/推送。
 - 下一步补接收方 Retry-After、有上限的指数退避和抖动，再进入 HMAC 与接收方幂等。
+
+## 最新进度：HTTP 重试策略
+
+- 接续工作区已有的未提交重试改动，没有覆盖其他改动、自动提交或操作用户服务。本轮未读取 `.env`，未操作业务数据库，无新迁移。
+- `internal/delivery/retry.go`：`RetryPolicy.Delay` 接入 Asynq，指数上界为 `min(base × 2^n, max)`（n 从 0 起），在上界的一半到全部之间抖动。配置 `RETRY_BASE_DELAY=5s`、`RETRY_MAX_DELAY=1m`，校验 `0 < base <= max`；每轮 3 次领取预算不变。
+- 顺序：Sender 分类并提取可重试响应的 Retry-After → Worker 保存结果并返回带内存元数据的错误 → Asynq 调用策略计算延迟。秒数和 HTTP 日期可延长抖动结果，但不超过 max；非法/过期值回退普通退避，超大合法整数截断而不溢出。重复响应头忽略，不按逗号拆分（HTTP 日期本身有逗号）。
+- 结果写库失败仍携带接收端建议；原始响应头不进入错误文本、日志、数据库或任务 payload。永久失败和耗尽业务预算正常使用 SkipRetry。
+- `cmd/receiver` 新增 `-retry-after`，可用 `go run ./cmd/receiver -status 429 -retry-after 10` 演示。Worker 启动日志显示两个非敏感延迟配置；无需改表，只需更新重启 Worker。
+- 补充重复响应头、非整倍数上限、纳秒/奇数边界，以及限流/预算耗尽后结果写库失败的测试。队列集成测试已增加 429、HTTP 日期、超大秒数、非法/重复头场景，断言调度回调结果、最终状态与历史。
+- **本轮实际通过**：`go test -count=1 ./...`、`go vet ./...`、`go test -race -count=1 ./...`、`git diff --check`。未启用数据库/队列集成测试；当前 Docker 命令提示 WSL 集成不可用，因此不能声称新增场景已经通过真实 MySQL/Redis 验证，也不要覆盖此前用户反馈 Docker 可用的历史事实。
+- 调度边界：Asynq v0.25.1 将计划时间存为 Unix 秒，可能向下取整不足一秒；扫描、排队及租约也影响发送时间。配置是调度策略，不保证精确执行时间或严格 Retry-After 等待下限；超过 max 的建议会被截断。Dispatcher 发布退避与 API 背压建议不受此配置影响。
+- 下一步：在独立已迁移空测试库和 Redis 7.4 中运行 `HOOKRELAY_OUTBOX_INTEGRATION=1 go test -count=1 -race -v ./tests/integration`，不使用日常业务库或清空表。随后实现 HMAC，再做接收方持久化幂等。
 
 ## 下次恢复环境
 

@@ -28,6 +28,7 @@ func TestSenderStatus(t *testing.T) {
 					t.Error("unexpected webhook request")
 				}
 				w.Header().Set("Location", target.URL)
+				w.Header().Set("Retry-After", "17")
 				w.WriteHeader(status)
 			}))
 			defer server.Close()
@@ -35,6 +36,9 @@ func TestSenderStatus(t *testing.T) {
 				URL: server.URL, DeliveryID: "9", Payload: []byte(payload),
 			})
 			wantRetry := status == 408 || status == 429 || status >= 500
+			if wantRetry && result.RetryAfter != "17" || !wantRetry && result.RetryAfter != "" {
+				t.Fatal("Retry-After must be forwarded only for retryable HTTP responses")
+			}
 			if result.HTTPStatus != status || result.Retryable != wantRetry || result.Latency <= 0 {
 				t.Fatalf("unexpected result: %+v", result)
 			}
@@ -43,6 +47,34 @@ func TestSenderStatus(t *testing.T) {
 			}
 			if redirects.Load() != 0 {
 				t.Fatal("sender followed a redirect")
+			}
+		})
+	}
+}
+
+func TestSenderRetryAfterHeaders(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		values []string
+		want   string
+	}{
+		{name: "absent"},
+		{name: "seconds", values: []string{"17"}, want: "17"},
+		{name: "HTTP date contains comma", values: []string{"Fri, 02 Jan 2026 03:04:05 GMT"}, want: "Fri, 02 Jan 2026 03:04:05 GMT"},
+		{name: "duplicate", values: []string{"17", "30"}},
+		{name: "identical duplicate", values: []string{"17", "17"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				for _, value := range tt.values {
+					w.Header().Add("Retry-After", value)
+				}
+				w.WriteHeader(http.StatusTooManyRequests)
+			}))
+			defer server.Close()
+			result, err := NewSender(time.Second).Send(context.Background(), Request{URL: server.URL})
+			if !errors.Is(err, ErrHTTPStatus) || !result.Retryable || result.RetryAfter != tt.want {
+				t.Fatalf("result=%+v err=%v", result, err)
 			}
 		})
 	}

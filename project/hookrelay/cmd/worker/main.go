@@ -43,17 +43,19 @@ func run(ctx context.Context) error {
 	defer pool.Close()
 
 	worker := delivery.Worker{Store: store.DeliveryStore{DB: db}, Send: delivery.NewSender(task.HTTPTimeout).Send, AllowedURL: cfg.AllowedEndpointURL}
+	retryPolicy := delivery.RetryPolicy{BaseDelay: cfg.RetryBaseDelay, MaxDelay: cfg.RetryMaxDelay}
 	server := asynq.NewServer(asynq.RedisClientOpt{Addr: cfg.RedisAddr}, asynq.Config{
 		Concurrency:     1,
 		Queues:          map[string]int{task.Queue: 1},
 		ShutdownTimeout: 25 * time.Second,
+		RetryDelayFunc:  retryPolicy.Delay,
 	})
 	mux := asynq.NewServeMux()
 	mux.Handle(task.TypeDelivery, worker)
 	if err := server.Start(mux); err != nil {
 		return err
 	}
-	slog.Info("worker started")
+	slog.Info("worker started", "retry_base_delay", cfg.RetryBaseDelay, "retry_max_delay", cfg.RetryMaxDelay)
 	<-ctx.Done()
 	server.Shutdown()
 	return nil

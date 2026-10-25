@@ -62,6 +62,7 @@ func TestAsyncDelivery(t *testing.T) {
 	var mu sync.Mutex
 	counts := map[string]int{}
 	deliveryIDs := map[string]string{}
+	retryDelays := map[uint64][]time.Duration{}
 	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		mu.Lock()
@@ -81,12 +82,44 @@ func TestAsyncDelivery(t *testing.T) {
 				w.WriteHeader(500)
 				return
 			}
+		case `"rate-limited"`:
+			if count == 1 {
+				w.Header().Set("Retry-After", "1")
+				w.WriteHeader(429)
+				return
+			}
+		case `"retry-date"`:
+			if count == 1 {
+				w.Header().Set("Retry-After", time.Now().Add(time.Hour).UTC().Format(http.TimeFormat))
+				w.WriteHeader(503)
+				return
+			}
+		case `"retry-cap"`:
+			if count == 1 {
+				w.Header().Set("Retry-After", "999999999999999999999999")
+				w.WriteHeader(503)
+				return
+			}
+		case `"retry-invalid"`:
+			if count == 1 {
+				w.Header().Set("Retry-After", "-1")
+				w.WriteHeader(503)
+				return
+			}
+		case `"retry-duplicate"`:
+			if count == 1 {
+				w.Header().Add("Retry-After", "1")
+				w.Header().Add("Retry-After", "2")
+				w.WriteHeader(503)
+				return
+			}
 		case `"replay"`:
 			if count == 1 {
 				w.WriteHeader(400)
 				return
 			}
 		case `"permanent"`:
+			w.Header().Set("Retry-After", "3600")
 			w.WriteHeader(400)
 			return
 		case `"exhausted"`:
@@ -133,10 +166,21 @@ func TestAsyncDelivery(t *testing.T) {
 		}
 	}()
 	worker := delivery.Worker{Store: store.DeliveryStore{DB: db}, Send: delivery.NewSender(time.Second).Send, AllowedURL: receiver.URL}
+	retryPolicy := delivery.RetryPolicy{BaseDelay: 100 * time.Millisecond, MaxDelay: 2 * time.Second}
 	server := asynq.NewServer(redis, asynq.Config{
 		Concurrency: 1, Queues: map[string]int{queue: 1},
 		TaskCheckInterval: 50 * time.Millisecond, DelayedTaskCheckInterval: 100 * time.Millisecond,
-		RetryDelayFunc:  func(int, error, *asynq.Task) time.Duration { return 100 * time.Millisecond },
+		RetryDelayFunc: func(n int, err error, job *asynq.Task) time.Duration {
+			delay := retryPolicy.Delay(n, err, job)
+			var payload task.Payload
+			if err := json.Unmarshal(job.Payload(), &payload); err != nil {
+				t.Error(err)
+			}
+			mu.Lock()
+			retryDelays[payload.DeliveryID] = append(retryDelays[payload.DeliveryID], delay)
+			mu.Unlock()
+			return delay
+		},
 		ShutdownTimeout: 3 * time.Second,
 	})
 	mux := asynq.NewServeMux()
@@ -233,6 +277,7 @@ func TestAsyncDelivery(t *testing.T) {
 		attempts     int
 	}{
 		{"success", "succeeded", 1}, {"temporary", "succeeded", 2}, {"permanent", "failed", 1}, {"exhausted", "failed", 3},
+		{"rate-limited", "succeeded", 2}, {"retry-date", "succeeded", 2}, {"retry-cap", "succeeded", 2}, {"retry-invalid", "succeeded", 2}, {"retry-duplicate", "succeeded", 2},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			result := create(t, tt.name)
@@ -258,8 +303,13 @@ func TestAsyncDelivery(t *testing.T) {
 				}
 				if i < len(history)-1 {
 					wantStatus = "retrying"
-					if tt.name == "temporary" {
+					switch tt.name {
+					case "temporary":
 						wantCode = 500
+					case "rate-limited":
+						wantCode = 429
+					case "retry-date", "retry-cap", "retry-invalid", "retry-duplicate":
+						wantCode = 503
 					}
 				}
 				if a.AttemptNumber != uint32(i+1) || a.Generation != 1 || a.Status != wantStatus || a.HTTPStatus == nil || *a.HTTPStatus != wantCode || a.FinishedAt == nil || a.LatencyMS == nil {
@@ -297,6 +347,29 @@ func TestAsyncDelivery(t *testing.T) {
 				after = page.Next
 			}
 			waitQueueFinal(t, result.DeliveryID, tt.status == "failed")
+			mu.Lock()
+			delays := append([]time.Duration(nil), retryDelays[result.DeliveryID]...)
+			mu.Unlock()
+			if len(delays) != tt.attempts-1 {
+				t.Fatalf("retry count=%d want=%d", len(delays), tt.attempts-1)
+			}
+			for n, delay := range delays {
+				switch tt.name {
+				case "rate-limited":
+					if delay != time.Second {
+						t.Fatalf("seconds Retry-After not used: %v", delay)
+					}
+				case "retry-date", "retry-cap":
+					if delay != retryPolicy.MaxDelay {
+						t.Fatalf("Retry-After not capped: %v", delay)
+					}
+				default:
+					ceiling := retryPolicy.BaseDelay * time.Duration(1<<n)
+					if delay < ceiling/2 || delay > ceiling {
+						t.Fatalf("incorrect fallback backoff: %v", delay)
+					}
+				}
+			}
 			if entryFor(t, result.DeliveryID).Status != "published" {
 				t.Fatal("outbox must be published")
 			}

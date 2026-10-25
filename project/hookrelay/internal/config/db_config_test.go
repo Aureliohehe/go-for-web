@@ -2,6 +2,7 @@ package config_test
 
 import (
 	"testing"
+	"time"
 
 	"github.com/aurelio/hookrelay/internal/config"
 )
@@ -17,6 +18,8 @@ func TestLoadDBConfigMissingPassword(t *testing.T) {
 }
 
 func TestLoadDBConfigSuccess(t *testing.T) {
+	t.Setenv("RETRY_BASE_DELAY", "")
+	t.Setenv("RETRY_MAX_DELAY", "")
 	t.Setenv("MAX_PENDING_DELIVERIES", "10000")
 	t.Setenv("REDIS_ADDR", "127.0.0.1:16379")
 	t.Setenv("HTTP_ADDR", "")
@@ -34,14 +37,15 @@ func TestLoadDBConfigSuccess(t *testing.T) {
 	}
 
 	want := config.Config{
-		HTTPAddr:             "127.0.0.1:8080",
-		MySQLHost:            "127.0.0.1",
-		MySQLPort:            "13306",
-		RedisAddr:            "127.0.0.1:16379",
-		MySQLUser:            "test_user",
-		MySQLPassword:        "test_password",
-		MySQLDatabase:        "test_db",
-		APIKey:               "test-key",
+		HTTPAddr:       "127.0.0.1:8080",
+		MySQLHost:      "127.0.0.1",
+		MySQLPort:      "13306",
+		RedisAddr:      "127.0.0.1:16379",
+		MySQLUser:      "test_user",
+		MySQLPassword:  "test_password",
+		MySQLDatabase:  "test_db",
+		APIKey:         "test-key",
+		RetryBaseDelay: 5 * time.Second, RetryMaxDelay: time.Minute,
 		MaxPendingDeliveries: 10000,
 	}
 	if cfg != want {
@@ -50,6 +54,8 @@ func TestLoadDBConfigSuccess(t *testing.T) {
 }
 
 func TestLoadDBConfigDefaults(t *testing.T) {
+	t.Setenv("RETRY_BASE_DELAY", "")
+	t.Setenv("RETRY_MAX_DELAY", "")
 	t.Setenv("MAX_PENDING_DELIVERIES", "")
 	t.Setenv("REDIS_ADDR", "")
 	t.Setenv("HTTP_ADDR", "")
@@ -65,13 +71,14 @@ func TestLoadDBConfigDefaults(t *testing.T) {
 		t.Fatalf("配置完整时不应报错：%v", err)
 	}
 	want := config.Config{
-		HTTPAddr:             "127.0.0.1:8080",
-		MySQLHost:            "127.0.0.1",
-		MySQLPort:            "13306",
-		RedisAddr:            "127.0.0.1:16379",
-		MySQLUser:            "hookrelay",
-		MySQLPassword:        "test_password",
-		MySQLDatabase:        "hookrelay",
+		HTTPAddr:       "127.0.0.1:8080",
+		MySQLHost:      "127.0.0.1",
+		MySQLPort:      "13306",
+		RedisAddr:      "127.0.0.1:16379",
+		MySQLUser:      "hookrelay",
+		MySQLPassword:  "test_password",
+		MySQLDatabase:  "hookrelay",
+		RetryBaseDelay: 5 * time.Second, RetryMaxDelay: time.Minute,
 		MaxPendingDeliveries: 10000,
 	}
 	if cfg != want {

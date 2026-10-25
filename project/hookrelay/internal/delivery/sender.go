@@ -20,6 +20,7 @@ type Request struct {
 type Result struct {
 	HTTPStatus int
 	Retryable  bool
+	RetryAfter string
 	Latency    time.Duration
 }
 
@@ -64,5 +65,9 @@ func (s *Sender) Send(ctx context.Context, input Request) (result Result, err er
 	}
 	result.Retryable = response.StatusCode == 408 || response.StatusCode == 429 ||
 		(response.StatusCode >= 500 && response.StatusCode < 600)
+	if values := response.Header.Values("Retry-After"); result.Retryable && len(values) == 1 {
+		// Retry-After is a single value, not a list. Ignore ambiguous duplicates.
+		result.RetryAfter = values[0]
+	}
 	return result, ErrHTTPStatus
 }

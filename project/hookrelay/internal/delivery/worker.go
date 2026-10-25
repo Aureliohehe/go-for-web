@@ -71,12 +71,12 @@ func (w Worker) ProcessTask(ctx context.Context, t *asynq.Task) error {
 	}
 	// Do not record raw HTTP errors: they can contain URLs or credentials.
 	if err := w.Store.Finish(ctx, work, status, result.HTTPStatus, reason, result.Latency); err != nil {
-		return errors.New("save delivery result failed")
+		return &retryError{message: "save delivery result failed", after: result.RetryAfter}
 	}
 	slog.Info("delivery attempt", "event_id", work.Event.ID, "delivery_id", work.Delivery.ID,
 		"generation", work.Delivery.Generation, "attempt", work.Delivery.AttemptCount, "status", status, "http_status", result.HTTPStatus, "latency_ms", result.Latency.Milliseconds())
 	if status == "retrying" {
-		return errors.New("delivery temporarily failed")
+		return &retryError{message: "delivery temporarily failed", after: result.RetryAfter}
 	}
 	if status == "failed" {
 		return fmt.Errorf("delivery failed: %w", asynq.SkipRetry)

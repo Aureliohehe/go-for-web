@@ -7,11 +7,14 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config contains settings for the API and the database.
 // Never log this struct: it contains the database password.
 type Config struct {
+	RetryBaseDelay       time.Duration
+	RetryMaxDelay        time.Duration
 	MaxPendingDeliveries int64
 	RedisAddr            string
 	HTTPAddr             string
@@ -51,6 +54,14 @@ func load(getenv func(string) string) (Config, error) {
 		return Config{}, fmt.Errorf("MAX_PENDING_DELIVERIES must be a positive integer")
 	}
 	cfg.MaxPendingDeliveries = limit
+	cfg.RetryBaseDelay, err = time.ParseDuration(value("RETRY_BASE_DELAY", "5s"))
+	if err != nil || cfg.RetryBaseDelay <= 0 {
+		return Config{}, fmt.Errorf("RETRY_BASE_DELAY must be a positive duration")
+	}
+	cfg.RetryMaxDelay, err = time.ParseDuration(value("RETRY_MAX_DELAY", "1m"))
+	if err != nil || cfg.RetryMaxDelay < cfg.RetryBaseDelay {
+		return Config{}, fmt.Errorf("RETRY_MAX_DELAY must be a duration >= RETRY_BASE_DELAY")
+	}
 	if cfg.MySQLPassword == "" {
 		return Config{}, fmt.Errorf("MYSQL_PASSWORD is required; export the variables in .env first")
 	}

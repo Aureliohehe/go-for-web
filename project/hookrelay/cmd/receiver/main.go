@@ -12,6 +12,7 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:9090", "listen address")
 	status := flag.Int("status", 200, "HTTP response status")
 	delay := flag.Duration("delay", 0, "delay before response, e.g. 8s")
+	retryAfter := flag.String("retry-after", "", "Retry-After response header, e.g. 10")
 	flag.Parse()
 	if *status < 200 || *status > 599 {
 		log.Fatal("status must be 200..599")
@@ -23,6 +24,9 @@ func main() {
 		defer timer.Stop()
 		select {
 		case <-timer.C:
+			if *retryAfter != "" {
+				w.Header().Set("Retry-After", *retryAfter)
+			}
 			w.WriteHeader(*status)
 		case <-r.Context().Done():
 		}

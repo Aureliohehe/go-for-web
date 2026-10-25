@@ -49,6 +49,8 @@ func TestWorker(t *testing.T) {
 		{name: "terminal skips send", terminal: true},
 		{name: "claim error", claimErr: errors.New("db error"), wantErr: true},
 		{name: "save failed", status: "succeeded", code: 200, attempt: 1, finishErr: errors.New("db error"), wantErr: true},
+		{name: "rate limit save failed", status: "retrying", code: 429, retryable: true, sendErr: ErrHTTPStatus, attempt: 1, finishErr: errors.New("db error"), wantErr: true},
+		{name: "exhausted save failed", status: "failed", code: 503, retryable: true, sendErr: ErrHTTPStatus, attempt: task.MaxAttempts, finishErr: errors.New("db error"), wantErr: true},
 		{name: "URL disallowed", status: "failed", disallowed: true, attempt: 1, wantErr: true, skipRetry: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -66,7 +68,7 @@ func TestWorker(t *testing.T) {
 				if req.DeliveryID != "9" || req.URL != "http://receiver/webhook" || string(req.Payload) != `{ "id": 1 }` {
 					t.Fatal("wrong sender input")
 				}
-				return Result{HTTPStatus: tt.code, Retryable: tt.retryable, Latency: 12 * time.Millisecond}, tt.sendErr
+				return Result{HTTPStatus: tt.code, Retryable: tt.retryable, RetryAfter: "20", Latency: 12 * time.Millisecond}, tt.sendErr
 			}}
 			if tt.disallowed {
 				worker.AllowedURL = "http://other/webhook"
@@ -74,6 +76,14 @@ func TestWorker(t *testing.T) {
 			err := worker.ProcessTask(context.Background(), asynq.NewTask(task.TypeDelivery, []byte(`{"delivery_id":9,"generation":1}`)))
 			if (err != nil) != tt.wantErr || errors.Is(err, asynq.SkipRetry) != tt.skipRetry || repo.status != tt.status {
 				t.Fatalf("status=%s err=%v", repo.status, err)
+			}
+			var retry *retryError
+			wantHint := tt.status == "retrying" || tt.finishErr != nil
+			if errors.As(err, &retry) != wantHint {
+				t.Fatal("retry metadata did not match result")
+			}
+			if wantHint && retry.after != "20" {
+				t.Fatal("Retry-After lost between Sender and queue")
 			}
 			wantSends := 1
 			if tt.terminal || tt.claimErr != nil || tt.disallowed {

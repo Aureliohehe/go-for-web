@@ -12,6 +12,8 @@
 
 用户已完成 `000003`（Outbox）和 `000004`（接入锁），助手已只读确认，**不要重复导入**。`000005_create_delivery_attempts.up.sql` 已由助手按用户授权导入 `hookrelay`，并验证表结构、索引、外键及导入时历史记录为 0；五份迁移均已完成，不要重复执行。本轮失败重放不需要新迁移。隔离 MySQL 8.0.42/Redis 7.4 下已验证并发重放、Outbox 写入失败回滚、重放与新事件共享容量、旧 generation 隔离及真实 HTTP 重放后成功投递；历史保留且投递 ID 不变。
 
+HTTP 重试策略已接入 Worker：有上限的指数退避与抖动、秒数/HTTP 日期格式的 Retry-After。无需新迁移。当前单测已通过；新增队列集成场景本轮尚未运行（Docker 的 WSL 集成不可用），不视为已完成真实队列验收。
+
 协作方式：助手写代码、用户理解逻辑；优先核心流程，避免过多防御性代码。
 
 当前业务入口是 `cmd/api`；`cmd/healthcheck` 保留为练习程序。API 通过环境变量 `API_KEY` 配置管理接口密钥，不提供默认值。
@@ -44,7 +46,7 @@ go run ./cmd/dispatcher
 go run ./cmd/api
 ```
 
-创建接收端后，按下方示例提交事件并查询投递。模拟故障时，停止并重启**模拟接收端**：`go run ./cmd/receiver -status 500` 或 `go run ./cmd/receiver -delay 8s`，再提交新事件。默认使用 Asynq 退避，重试不是立即发生。只运行一个 Worker 和一个 Dispatcher；接收端没有持久化去重和验签。使用 Compose 的 Redis 7.4，宿主旧 Redis 5 不兼容 Asynq 的归档操作。
+创建接收端后，按下方示例提交事件并查询投递。模拟故障时，停止并重启**模拟接收端**：`go run ./cmd/receiver -status 500` 或 `go run ./cmd/receiver -delay 8s`，再提交新事件。默认使用下述自定义退避，重试不是立即发生。也可用 `go run ./cmd/receiver -status 429 -retry-after 10` 模拟限流。只运行一个 Worker 和一个 Dispatcher；接收端没有持久化去重和验签。使用 Compose 的 Redis 7.4，宿主旧 Redis 5 不兼容 Asynq 的归档操作。
 
 ## 接口与测试
 
@@ -117,7 +119,19 @@ curl -i http://127.0.0.1:8080/v1/deliveries/1 -H "X-API-Key: $API_KEY"
 
 使用提交事件响应中的 `delivery_id`。状态：`pending → processing → succeeded`；临时失败进入 `retrying`，永久错误或耗尽预算进入 `failed`。`attempt_count` 在领取时加一：崩溃发生在 HTTP 前也会占用预算，因此不是精确的远端接收次数。
 
-`internal/delivery/sender.go` 已实现单次 HTTP POST：原样发送 payload，携带稳定 `X-Webhook-ID`；2xx 成功，网络错误/超时/408/429/5xx 标记可重试，3xx 不跟随且视为永久失败，其余 4xx 不重试。Sender 使用调用方指定的 HTTP 超时，传递 context，最多读取 4 KiB 响应体以便连接复用。它不负责排队、自动重试或写数据库，也尚未实现 HMAC、Retry-After，仅供受控本地测试。
+`internal/delivery/sender.go` 已实现单次 HTTP POST：原样发送 payload，携带稳定 `X-Webhook-ID`；2xx 成功，网络错误/超时/408/429/5xx 标记可重试，3xx 不跟随且视为永久失败，其余 4xx 不重试。Sender 使用调用方指定的 HTTP 超时，传递 context，最多读取 4 KiB 响应体以便连接复用。它不负责排队、自动重试或写数据库，对可重试响应提取单个 Retry-After 供 Worker 调度；重复响应头忽略。尚未实现 HMAC，仅供受控本地测试。
+
+## HTTP 重试策略
+
+Worker 使用 `internal/delivery/retry.go` 的 `RetryPolicy.Delay` 作为 Asynq 的 `RetryDelayFunc`，不另建数据库重试调度器。
+
+- `RETRY_BASE_DELAY` 默认 `5s`，`RETRY_MAX_DELAY` 默认 `1m`；使用 Go duration 格式，要求 `0 < base <= max`。修改后重启 Worker。
+- 第 n 次重试（从 0 开始）的退避上界为 `min(base × 2^n, max)`，在其一半到全部之间随机取值。默认前两次为 2.5～5 秒、5～10 秒；每轮最多 3 次领取的业务预算不变。
+- 网络错误、超时、408、429、5xx 可重试。合法 Retry-After 支持非负整数秒和 HTTP 日期，最终延迟取抖动结果与接收端建议的较大值，但不超过 max。过长值会被截断，因此不能保证遵守超过上限的接收端等待要求。
+- 空值、负数、小数、无效/过期日期和重复响应头不延长退避；2xx、3xx 和永久 4xx 不因该响应头而重试。有效但过大的整数按 max 处理，避免溢出。
+- 原始响应头只在内存中传给调度回调，不写日志、数据库或任务 payload。结果写库失败时也保留本次重试建议；后续执行仍受租约与业务预算约束。
+- **这是调度延迟，不是精确发送时间。** Asynq v0.25.1 使用秒级时间戳（可能向下取整不足一秒），扫描间隔、队列积压与执行租约也会影响实际时间。毫秒配置适合测试，不能作为严格的等待下限或执行时刻保证。
+- 配置仅控制 Worker 的任务重试，不改变 Dispatcher 的 Outbox 发布退避，也不同于 API 满载响应中的 `Retry-After: 5`。
 
 ## 查询投递尝试历史
 
@@ -179,13 +193,13 @@ Outbox 状态：`pending → processing → published`。领取用短事务和 3
 ## Worker 与当前限制
 
 - 任务类型 `webhook:deliver`，队列 `webhooks`，payload 仅含 delivery_id 与 generation。稳定任务 ID 抑制队列内重复；已终态或旧 generation 由数据库跳过。
-- 当前默认：单进程、并发 1，最多 3 次领取，HTTP 超时 5 秒、任务超时 20 秒、执行租约 30 秒。参数集中于 `internal/task/delivery.go`；Asynq 负责退避，数据库负责状态与预算。
+- 当前默认：单进程、并发 1，最多 3 次领取，HTTP 超时 5 秒、任务超时 20 秒、执行租约 30 秒。次数及超时集中于 `internal/task/delivery.go`；退避通过上述环境变量配置，由 Asynq 调度，数据库负责状态与预算。
 - 领取使用短事务；发送不持有事务；回写校验 generation 和 attempt_count。租约过期仍可能重复发送，不能保证外部业务恰好一次。
 - 已保存但未入队的记录由 Outbox 恢复。**已 published 后 Redis 丢失任务不在该恢复范围内**，仍需 Reconciler。
 - 容量限制针对未完成投递数量，不是总数据量或 Redis 内存限制；终态事件和 Outbox 历史仍会累积，目前没有清理机制。
 - Redis 数据丢失、任务因数据库长期故障耗尽重试、最终结果无法写库，可能遗留非终态记录；没有 Reconciler。Worker 强杀恢复时间、多实例并发尚未做故障验证。
-- 暂无 HMAC、接收端幂等、接收方 Retry-After 解析和全局端点隔离。签名密钥目前仅保存，不参与发送。
+- 暂无 HMAC、接收端幂等和全局端点隔离。签名密钥目前仅保存，不参与发送。
 
 ## 下一步
 
-完善 HTTP 重试策略：接收方 Retry-After 解析、有上限的退避与抖动。之后补 HMAC 和接收方幂等；Redis 丢任务后的自动对账仍是后续任务。
+在隔离 MySQL/Redis 7.4 上运行新增重试集成场景，确认真实队列链路；之后补 HMAC 和接收方幂等。Redis 丢任务后的自动对账仍是后续任务。
