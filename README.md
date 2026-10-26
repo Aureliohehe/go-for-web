@@ -1,355 +1,487 @@
 # HookRelay
 
-基于 Go、MySQL、Redis 和 Asynq 的可靠 Webhook 投递平台项目。
+**基于 Go 的可靠 Webhook 异步投递系统**
 
-目标能力：幂等事件接入、Outbox 可靠入队、异步 HTTP 投递、有限重试、投递历史、失败重放及接收方签名与幂等示例。
+HookRelay 是一个使用 Go、Gin、MySQL、Redis 和 Asynq 构建的 Webhook 投递项目，重点研究异步任务处理中的数据一致性、重复执行、失败重试、并发控制与故障恢复。
 
-> 已打通事件/投递/Outbox 同事务 → Dispatcher → Redis/Asynq → Worker → HTTP 投递，支持入队恢复和有限投递重试。已加入未完成投递容量限制、投递尝试历史、分页查询和失败重放；已接入 HMAC 签名、接收端验签与事务性持久化幂等，已支持单 Worker 
+项目采用 **Transactional Outbox + 异步任务队列 + Worker** 架构，实现事件持久化与 HTTP 投递解耦；结合数据库状态机、执行租约、Generation 版本控制及接收端事务性幂等，处理任务重复入队、执行超时和异常恢复等场景。
 
-## 项目说明
+> 项目定位：面向后端可靠性设计与工程实践的学习项目，目前主要针对单实例及受控测试环境，不宣称具备完整的生产级高可用能力。
 
+## 1. 技术栈
 
-已完成 `000003`（Outbox）和 `000004`（接入锁），助手已只读确认，。`000005_create_delivery_attempts.up.sql` 已由助手按用户授权导入 `hookrelay`，并验证表结构、索引、外键及导入时历史记录为 0；前五份迁移均已完成，不要重复执行。**本轮新增 `000006_add_delivery_recovery.up.sql`，仅在隔离测试库验证，开发库尚未执行；升级代码前先按下方“自动对账恢复”章节补这份迁移。**隔离 MySQL 8.0.42/Redis 7.4 下已验证并发重放、Outbox 写入失败回滚、重放与新事件共享容量、旧 generation 隔离及真实 HTTP 重放后成功投递；历史保留且投递 ID 不变。
+| 组件 | 技术 | 职责 |
+|---|---|---|
+| API | Go、Gin | 事件接入、接口鉴权、状态查询 |
+| 数据存储 | MySQL、GORM | 事件持久化、事务、投递状态机 |
+| 任务队列 | Redis、Asynq | 异步任务调度和重试 |
+| Dispatcher | Go | Outbox 扫描、任务发布 |
+| Worker | Go | HTTP 投递、并发控制和结果回写 |
+| Reconciler | Go | 异常任务对账与自动恢复 |
+| Receiver | Go、MySQL | HMAC 验签、持久化去重 |
+| 环境与测试 | Docker Compose、Go Test | 本地运行、集成测试及故障验证 |
 
-Docker 本轮已恢复可用；隔离 MySQL 8.4 / Redis 7.4 上已通过 Retry-After、退避、签名队列测试及“接收端已提交但响应超时”的幂等重投验证：2 次 HTTP 请求、1 条业务记录，最终投递成功。
+## 2. 系统架构
 
-Receiver 现在需要 `RECEIVER_SIGNING_SECRET` 和独立的 `RECEIVER_MYSQL_*` 配置。新增迁移 **`migrations/receiver/000001_create_receipts.up.sql` 仅应用到接收端独立数据库**，与平台 `000006` 无关；助手仅在隔离测试库导入，用户开发环境尚待配置，不要重复导入平台五份迁移。
+```text
+                       Client
+                         |
+                         v
+                  +-------------+
+                  |   Gin API   |
+                  +-------------+
+                         |
+              MySQL Transaction
+                         |
+          +--------------+--------------+
+          |              |              |
+          v              v              v
+        Events       Deliveries       Outbox
+                         |              |
+                         |              v
+                         |         Dispatcher
+                         |              |
+                         |              v
+                         |        Redis / Asynq
+                         |              |
+                         |              v
+                         |            Worker
+                         |              |
+                         |         HTTP + HMAC
+                         |              |
+                         |              v
+                         |           Receiver
+                         |              |
+                         |       Verify + Dedup
+                         |              |
+                         +<--- State Update
 
-新增单 Worker 内端点隔离：`WORKER_CONCURRENCY=4`、`ENDPOINT_CONCURRENCY=1`，满额任务在领取前延迟重新入队，不消耗 HTTP 尝试预算。端点配额本身无需迁移，但本轮自动恢复需要平台 `000006`；Receiver 独立库的首次配置要求不变。
+          Reconciler
+              |
+              +----> Check unfinished deliveries
+              |
+              +----> Recover eligible lost tasks
+```
 
-协作方式：助手写代码、用户理解逻辑；优先核心流程，避免过多防御性代码。
+### 核心流程
 
-当前业务入口是 `cmd/api`；`cmd/healthcheck` 保留为练习程序。API 通过环境变量 `API_KEY` 配置管理接口密钥，不提供默认值。
+1. 客户端调用 API 提交事件，携带 `Idempotency-Key`。
+2. API 在同一 MySQL 事务中写入 Event、Delivery 和 Outbox。
+3. Dispatcher 扫描可发布的 Outbox 记录，并将任务写入 Redis/Asynq。
+4. Worker 领取任务，校验投递状态、执行版本及租约，发送带 HMAC 签名的 HTTP 请求。
+5. Worker 将投递结果及尝试历史写回 MySQL。
+6. 对于可重试失败，使用 Asynq 按退避策略重新调度。
+7. Reconciler 定期检查符合条件的异常投递，并通过新一轮 Outbox 触发恢复。
 
-## 第一天：启动与验证
+**MySQL 是投递业务状态的主要依据，Redis/Asynq 负责任务调度。**
 
-[第一天操作指南](docs/day-01.md) 保留初始阶段的操作说明。当前启动需要额外配置 `API_KEY` 与 `ALLOWED_ENDPOINT_URL`，请优先按 [学习记录中的恢复环境步骤](docs/learning-progress.md#下次恢复环境) 运行。不要同时启动 `cmd/api` 与 `cmd/healthcheck`。
+系统不将 HTTP 响应成功与任务入队成功混为一谈；事件接收、消息发布、远端执行和状态确认是不同阶段。
 
-默认 API 地址：`127.0.0.1:8080`；MySQL 本地端口：`13306`；Redis：`127.0.0.1:16379`。
+## 3. 核心设计
 
-## 运行异步演示
+### 3.1 Transactional Outbox：解决双写一致性问题
+
+如果 API 先写 MySQL，再将任务发布到 Redis，可能出现：
+
+- MySQL 提交成功，但 Redis 发布失败。
+- 任务发布成功，但进程在确认状态前崩溃。
+- API 在数据库提交后异常退出，导致任务没有及时入队。
+
+HookRelay 使用 Transactional Outbox 模式：
+
+```text
+BEGIN TRANSACTION
+
+  INSERT events
+  INSERT deliveries
+  INSERT outbox
+
+COMMIT
+```
+
+事件、投递记录及 Outbox 在同一事务中提交，避免业务记录成功保存却没有对应待发布消息的问题。
+
+Dispatcher 独立扫描 Outbox，并使用领取租约与发布令牌处理任务重领及旧发布者回写。Redis 暂时不可用时，已提交的 Outbox 保留在 MySQL，等待后续发布。
+
+这里采用的是 **At-Least-Once** 思路：允许消息重复发布，通过下游状态校验和幂等处理降低重复执行的影响，而不是假设消息绝不会重复。
+
+### 3.2 幂等事件接入
+
+API 使用 `Idempotency-Key` 与事件内容摘要处理重复提交。
+
+| 请求场景 | API 行为 |
+|---|---|
+| 首次提交 | `202 Accepted`，创建事件与投递 |
+| 相同 Key、相同内容 | `200 OK`，复用原记录 |
+| 相同 Key、不同内容 | `409 Conflict` |
+
+幂等判断依赖数据库约束和事务处理，避免并发请求通过简单的“先查再写”检查后产生重复记录。
+
+请求摘要包含接收端、事件类型及原始 Payload 字节，因此 JSON 内容相同但原始字节不同的请求不一定被视为同一事件。
+
+### 3.3 Worker 执行状态与 Generation 隔离
+
+投递记录使用状态机表示生命周期：
+
+```text
+pending
+   |
+   v
+processing
+   |
+   +------> succeeded
+   |
+   +------> retrying ------> processing
+   |
+   +------> failed
+```
+
+Worker 领取任务时，在短事务内检查数据库状态及当前执行版本，登记尝试历史后再发送 HTTP 请求，避免在网络调用期间持续持有数据库事务。
+
+系统引入：
+
+- **Lease**：标识当前任务的执行租约，处理执行超时与重新领取。
+- **Generation**：区分人工重放或自动恢复后产生的新执行轮次。
+- **Attempt Count**：限制每轮业务投递尝试预算。
+- **条件回写**：防止旧执行结果覆盖新一轮投递状态。
+
+即使旧任务在恢复后继续返回结果，也不能直接修改新 Generation 的投递状态。
+
+### 3.4 HTTP 重试与失败重放
+
+Worker 根据 HTTP 结果区分成功、可重试错误与永久错误。
+
+| 结果 | 处理策略 |
+|---|---|
+| 2xx | 投递成功 |
+| 网络错误、超时 | 可重试 |
+| 408、429、5xx | 可重试 |
+| 3xx、其他 4xx | 视为永久失败 |
+
+重试使用带随机抖动的指数退避，并在可重试场景中解析 `Retry-After`，但实际延迟受配置的最大退避上限约束。
+
+默认每轮最多允许 3 次业务领取；次数耗尽或发生永久失败后进入 `failed`。
+
+系统提供人工 Replay 接口，可对失败投递创建新的执行轮次，并保留原有 Delivery ID 和投递尝试历史。
+
+### 3.5 背压与端点并发隔离
+
+当接入速度超过消费能力时，持续创建任务可能导致积压不断扩大。
+
+HookRelay 使用 `MAX_PENDING_DELIVERIES` 限制非终态投递数量。达到上限后拒绝新的事件接入，并返回 `503` 与 `Retry-After`；已经成功接入的相同幂等请求仍可复用原结果。
+
+Worker 还支持单进程内的端点级并发限制，例如：
+
+```bash
+export WORKER_CONCURRENCY=4
+export ENDPOINT_CONCURRENCY=1
+```
+
+这表示 Worker 最多同时使用 4 个执行槽，且单个 Endpoint 最多持有 1 个执行许可。
+
+当某个端点额度已满时，任务通过延迟替代入队等待，而不是阻塞执行槽；该等待不计入实际 HTTP 尝试预算。
+
+目前端点配额只在单个 Worker 进程内生效，**不提供跨 Worker 实例的全局并发限制，也不保证严格公平调度**。
+
+### 3.6 Reconciler：异常任务自动恢复
+
+Transactional Outbox 主要解决消息尚未确认发布前的可靠性问题。
+
+对于 Outbox 已标记 `published`，但 Redis 任务后来丢失、归档或投递停滞的情况，单纯重扫未发布 Outbox 并不足以完成恢复。
+
+HookRelay 引入独立 Reconciler：
+
+1. 扫描超过宽限期的未完成投递。
+2. 检查当前 Generation、Outbox 发布状态及 Redis 任务状态。
+3. 对可能丢失的任务进行事务内二次校验。
+4. 对符合恢复条件的投递增加 Generation，并写入新的 Outbox。
+5. 使用恢复次数上限与投递预算避免无限恢复。
+
+对账过程不会将 Redis 查询失败直接判定为任务丢失，也不会主动重置正常存活的任务。
+
+恢复机制仍存在检测延迟和竞态边界，不能提供严格的 Exactly-Once 执行保证。
+
+### 3.7 HMAC 签名与接收端幂等
+
+HTTP 投递使用 HMAC-SHA256 签名，主要请求头包括：
+
+- `X-Webhook-ID`
+- `X-Webhook-Timestamp`
+- `X-Webhook-Signature`
+
+接收端验证请求签名、时间戳与原始 Payload，使用恒定时间比较方式校验摘要。
+
+为了处理发送端超时后重复投递，示例 Receiver 使用独立 MySQL 数据库，在同一事务中完成：
+
+```text
+Verify Signature
+       |
+       v
+BEGIN TRANSACTION
+       |
+       +--> Insert Receipt (unique delivery_id)
+       |
+       +--> Insert Simulated Business Effect
+       |
+COMMIT
+       |
+       v
+HTTP Response
+```
+
+相同 Delivery ID、相同 Payload 的重复请求不会重复插入模拟业务记录。
+
+这里需要明确两个边界：
+
+- HMAC 用于验证消息真实性与完整性，不等于业务幂等，也不提供 Payload 加密。
+- Receiver 的事务性去重仅保护当前数据库内的模拟业务效果，不保证外部邮件、支付等副作用恰好执行一次。
+
+## 4. 可靠性验证
+
+项目包含单元测试与依赖真实 MySQL、Redis 的隔离集成测试。
+
+主要验证场景包括：
+
+| 场景 | 重点验证 |
+|---|---|
+| Outbox 写入失败 | 整个事件接入事务回滚 |
+| Redis 发布失败 | Outbox 保留并可重试发布 |
+| 入队成功但确认失败 | 重复发布不会直接绕过数据库执行保护 |
+| 相同幂等键并发提交 | 不产生重复事件记录 |
+| 旧 Generation 结果晚到 | 不覆盖新的投递状态 |
+| 失败后人工 Replay | 保留历史并重新建立执行轮次 |
+| 端点积压 | 慢端点不占满其他端点可使用的执行槽 |
+| 已发布任务丢失 | Reconciler 在满足条件时重新建立任务 |
+| Receiver 提交后响应超时 | 重试不重复产生数据库内的模拟业务效果 |
+
+### 典型故障场景：接收端已提交，但响应超时
+
+1. Worker 发送 Webhook 请求。
+2. Receiver 完成事务性业务写入。
+3. Receiver 延迟响应，Worker 发生 HTTP 超时。
+4. Worker 根据重试策略再次发送相同 Delivery ID。
+5. Receiver 识别已处理消息，直接返回成功响应。
+
+在隔离测试中，该场景观察到 **两次 HTTP 请求、一次模拟业务写入，最终投递成功**。
+
+这一案例展示了 At-Least-Once 投递与接收端业务幂等之间的关系，而不是宣称网络请求本身恰好发送一次。
+
+## 5. 快速开始
+
+### 环境要求
+
+- Go 1.27.1（仓库当前 `go.mod` 声明的版本）
+- Docker 与 Docker Compose
+- MySQL 8.4、Redis 7.4（由 Compose 配置启动）
+- Bash（用于以下命令和集成测试脚本）
+
+### 5.1 获取代码
+
+```bash
+git clone https://github.com/Aureliohehe/go-for-web.git
+cd go-for-web/project/hookrelay
+```
+
+### 5.2 启动依赖
+
+```bash
+cp .env.example .env
+```
+
+编辑 `.env`，设置 MySQL 密码、`API_KEY` 等必需配置，不要提交实际密钥。
 
 ```bash
 docker compose up -d --wait mysql redis
-set -a; . ./.env; set +a
-export REDIS_ADDR="${REDIS_ADDR:-127.0.0.1:16379}"
-export MAX_PENDING_DELIVERIES="${MAX_PENDING_DELIVERIES:-10000}"
-export ALLOWED_ENDPOINT_URL="${ALLOWED_ENDPOINT_URL:-http://127.0.0.1:9090/webhook}"
-# API_KEY 需自行配置；已有的 000001..000005 迁移勿重复执行。
-# 本轮需先执行新增 000006，见“自动对账恢复”章节。
 ```
 
-平台数据库前五份迁移已完成，勿重复执行；本轮只补 `000006`。**Receiver 尚未配置时，先按 [Receiver 数据库准备](#receiver-数据库准备) 创建独立库并导入接收端迁移。** 全新平台数据库需要按顺序执行顶层六份迁移。`000005` 不补造升级前的历史，所以历史条数可能小于过去的 attempt_count。
+默认本地端口：
 
-先在三个终端分别运行（均需加载上述环境）：
+| 服务 | 地址 |
+|---|---|
+| API | 127.0.0.1:8080 |
+| MySQL | 127.0.0.1:13306 |
+| Redis | 127.0.0.1:16379 |
+| 示例 Receiver | 127.0.0.1:9090 |
+
+**数据库初始化：** 全新平台数据库需要按顺序应用 `migrations/` 下的六份平台迁移。Receiver 还需要独立数据库和 `migrations/receiver/000001_create_receipts.up.sql`。迁移不会由启动命令自动完成。
+
+已有数据库应核对迁移记录，只执行尚未应用的迁移，不要重复导入。
+
+### 5.3 启动核心服务
+
+在各自终端进入 `project/hookrelay`，加载环境变量：
 
 ```bash
-go run ./cmd/worker
-go run ./cmd/dispatcher
+set -a
+. ./.env
+set +a
+
+export REDIS_ADDR="${REDIS_ADDR:-127.0.0.1:16379}"
+export ALLOWED_ENDPOINT_URL="${ALLOWED_ENDPOINT_URL:-http://127.0.0.1:9090/webhook}"
+```
+
+分别启动：
+
+```bash
 go run ./cmd/api
 ```
 
-创建端点（尚未启动 Receiver 也可以创建）：
-
 ```bash
-curl -s http://127.0.0.1:8080/v1/endpoints \
-  -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
-  -d '{"url":"http://127.0.0.1:9090/webhook"}'
+go run ./cmd/dispatcher
 ```
 
-保存响应中的 `id` 和一次性交付的 `signing_secret`，不要贴到对话或提交到 Git。在第四个终端配置 Receiver，交互输入可避免密钥进入 shell 命令历史：
+```bash
+go run ./cmd/worker
+```
+
+可选启动独立恢复进程：
 
 ```bash
-read -rsp 'Endpoint signing_secret: ' RECEIVER_SIGNING_SECRET; echo
-export RECEIVER_SIGNING_SECRET
-# 本终端还需加载下面配置的 RECEIVER_MYSQL_*，特别是独立数据库密码。
+go run ./cmd/reconciler
+```
+
+如需完整的端到端接收测试，还需配置 Receiver 独立 MySQL 数据库和 `RECEIVER_SIGNING_SECRET`，再启动：
+
+```bash
 go run ./cmd/receiver
 ```
 
-Receiver 单实例只使用一个端点密钥；多个端点指向相同 URL 但密钥不同，会验签失败。已有端点若未保存一次性密钥，请创建新端点并使用新 ID；GET 不提供取回密钥功能。之后再提交事件，避免 Receiver 尚未启动时耗尽投递预算。
+Receiver 的签名密钥来自创建 Endpoint 时的一次性响应；请先完成 Endpoint 创建与密钥配置，再提交测试事件。
 
-创建接收端后，按下方示例提交事件并查询投递。模拟故障时，停止并重启**模拟接收端**：`go run ./cmd/receiver -status 500` 或 `go run ./cmd/receiver -delay 8s`，再提交新事件。默认使用下述自定义退避，重试不是立即发生。也可用 `go run ./cmd/receiver -status 429 -retry-after 10` 模拟限流。只运行一个 Worker 和一个 Dispatcher；接收端已验签并持久化去重。`-delay 8s` 在首次业务事务提交后延迟响应，重复请求立即返回 204；`-status 500/429` 在写库前模拟拒绝，不产生业务记录。使用 Compose 的 Redis 7.4，宿主旧 Redis 5 不兼容 Asynq 的归档操作。
-
-## Receiver 数据库准备
-
-接收端默认使用同一 MySQL 实例上的**独立数据库/用户** `hookrelay_receiver`，不读取平台的 `MYSQL_*` 配置，不共享业务表。也可以通过 `RECEIVER_MYSQL_HOST/PORT` 指向另一实例。
-
-首次由数据库管理员连接（例如 `docker compose exec mysql mysql -uroot -p`），创建独立数据库和用户；密码自行替换，不要使用示例占位符：
-
-```sql
-CREATE DATABASE hookrelay_receiver;
-CREATE USER 'hookrelay_receiver'@'%' IDENTIFIED BY '<自行设置的接收端数据库密码>';
-GRANT SELECT, INSERT ON hookrelay_receiver.* TO 'hookrelay_receiver'@'%';
-```
-
-然后在项目根目录用管理员权限导入**一次**（以下命令使用容器已有的 root 环境配置，不输出密码）：
+### 5.4 创建 Webhook Endpoint
 
 ```bash
-docker compose exec -T mysql sh -c \
-  'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysql -uroot hookrelay_receiver' \
-  < migrations/receiver/000001_create_receipts.up.sql
+curl -i http://127.0.0.1:8080/v1/endpoints \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"http://127.0.0.1:9090/webhook"}'
 ```
 
-DDL 非事务性，若失败先检查两张表是否部分创建，不要盲目重跑或删表。Receiver 不自动建库/建表，缺表时拒绝启动。
+保存响应中的 Endpoint ID 和一次性 `signing_secret`。签名密钥不会通过查询接口再次返回。
 
-在 Receiver 终端设置（可自行保存到不提交的 `.env`，不会自动保存）：
+### 5.5 提交事件
 
-```bash
-export RECEIVER_MYSQL_HOST=127.0.0.1 RECEIVER_MYSQL_PORT=13306
-export RECEIVER_MYSQL_DATABASE=hookrelay_receiver RECEIVER_MYSQL_USER=hookrelay_receiver
-read -rsp 'Receiver database password: ' RECEIVER_MYSQL_PASSWORD; echo
-export RECEIVER_MYSQL_PASSWORD
-```
-
-不要把平台密码当作接收端密码；平台 API/Worker/Dispatcher 的数据库配置无需修改。默认接收端用户只需 SELECT/INSERT，不需要修改或清空历史的权限。
-
-## 接口与测试
-
-- `GET /healthz`：进程存活。
-- `GET /readyz`：数据库可用。两个健康接口均无需鉴权。
-- `POST /v1/endpoints`：需 `X-API-Key`，JSON 请求体只接收 `url`，且必须与 `ALLOWED_ENDPOINT_URL` 完全相同；成功返回 201，签名密钥仅在该响应中交付一次。设置 `Content-Type: application/json`。
-- `GET /v1/endpoints/:id`：查询接收端，需 `X-API-Key` 请求头；不返回签名密钥，响应 ID 为字符串。
-- `PATCH /v1/endpoints/:id`：需 `X-API-Key`，JSON 请求体仅 `{"enabled":true}` 或 `{"enabled":false}`；返回更新后的接收端公开字段，不返回密钥。禁用拒绝新事件；Worker 在领取时发现禁用会将已有任务置为 failed；已发出的请求不能撤回。
-- `POST /v1/events`：需 `X-API-Key`、`Idempotency-Key` 和 JSON 请求体；首次返回 202，同键同内容返回 200 和原 ID，同键不同内容返回 409。HTTP 投递由独立 Worker 异步执行。
-- `GET /v1/deliveries/:id`：需 `X-API-Key`，返回投递 ID、事件 ID、状态、执行版本、尝试次数、最后 HTTP 状态/错误分类及创建/更新时间；不存在返回 404。
-- `GET /v1/deliveries/:id/attempts?limit=20&after=0`：需 `X-API-Key`，按尝试 ID 升序分页查询历史。
-- `POST /v1/deliveries/:id/replay`：需 `X-API-Key`，仅允许 failed 状态，成功返回 202 和新 generation；不需要请求体。
-- `go test ./...`：运行不依赖数据库的测试（包括 Sender/Receiver 的本地 HTTP 测试），集成测试默认跳过。
-- **推荐：`bash scripts/test-integration.sh`**。需要 Docker、Go、openssl；自动创建独立 MySQL 8.4/Redis 7.4 容器、随机本地端口和两个空测试库，应用平台与 Receiver 迁移，运行存储/背压/接收端/队列 race 测试，退出时只删除本次测试容器及其临时卷。不会加载 `.env`、操作已有容器或业务库；日志保留在输出的 `/tmp/hookrelay-integration-*`。
-- `HOOKRELAY_RECEIVER_INTEGRATION=1 go test -race -count=1 -v ./internal/receiver`：使用 `RECEIVER_MYSQL_*` 指向独立接收端测试库，需接收端迁移；覆盖并发去重、冲突、第二次写入失败回滚及新连接池读取已提交记录。
-- `HOOKRELAY_INTEGRATION=1 go test -count=1 -v ./internal/store ./cmd/api`：需 MySQL 和六份已应用迁移，覆盖事务、并发幂等、历史原子写入、游标查询、并发重放与旧轮次回写；测试回滚或只清理自身记录。
-- `HOOKRELAY_ADMISSION_INTEGRATION=1 go test -count=1 -race -run TestAdmissionIntegration ./internal/store`：仅对已迁移的独立空测试库运行，无其他业务进程；验证最后一个名额竞争、满载幂等、终态释放、事务回滚，以及新事件与重放争抢同一容量。不要清空业务库来满足测试条件。
-- `HOOKRELAY_OUTBOX_INTEGRATION=1 go test -count=1 -race -v ./tests/integration`：**仅对已迁移的独立测试数据库运行，Outbox 必须为空，不能有 API/Dispatcher/Worker 同时运行**。需 Redis 7.4；测试使用独立随机队列。覆盖成功/重试/归档、Redis 连接失败后恢复、领取后失联、入队后确认失败、旧执行令牌、真实 HTTP 历史分页及失败重放后成功投递。不要指向日常开发数据库，也不要为了通过检查清空业务表。同时设置 `HOOKRELAY_RECEIVER_INTEGRATION=1` 并配置独立空接收端库，可额外验证提交后响应超时的真实队列重投。
-
-用户已确认 Docker 工具及引擎可用，并完成 Compose 启动 MySQL、数据库停止与恢复的手动验证。`docs/day-01.md` 保留的是初始实现时的操作指南与验证记录，最新学习状态以学习进度文档为准。
-
-## 项目计划
-
-详见 [总体计划与每周验收标准](PLAN.md)，包含：
-
-- 项目范围、架构与可靠性边界。
-- 数据模型、API 和 Webhook 协议。
-- 6～8 周实施步骤及 4 周缩减方案。
-- 故障测试、压测与最终交付清单。
-
-## 提交事件
+将 `endpoint_id` 替换为实际创建的 Endpoint ID：
 
 ```bash
 curl -i http://127.0.0.1:8080/v1/events \
   -H "X-API-Key: $API_KEY" \
-  -H 'Idempotency-Key: order-42' \
-  -H 'Content-Type: application/json' \
-  -d '{"endpoint_id":"1","event_type":"order.created","payload":{"order_id":42}}'
+  -H "Idempotency-Key: order-42" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "endpoint_id": "1",
+    "event_type": "order.created",
+    "payload": {"order_id": 42}
+  }'
 ```
 
-将 `endpoint_id` 替换为已创建的接收端 ID（字符串）。成功响应：
+成功接入返回事件 ID 与投递 ID。`202 Accepted` 表示事件和 Outbox 已提交，不代表远端 HTTP 投递已经成功。
 
-```json
-{"event_id":"1","delivery_id":"1","reused":false}
-```
-
-- 幂等键为 1～128 字节可打印 ASCII，不含空格；事件类型为 1～128 字节，payload 必填，为任意 JSON 值，最多 256 KiB。
-- 摘要比较端点 ID、事件类型和 payload 原始字节；payload 内部空白变化也会冲突。不要在重试时重新格式化 payload。
-- 新事件端点不存在返回 404，禁用返回 409；已接受事件的同内容重试不受后来禁用影响。
-- 202 表示事件、投递和 Outbox 已在同一事务中提交；不表示已入队或已投递。
-- API 不再访问 Redis。Redis 不可用且积压未满时仍返回 202，Dispatcher 会后台重试，无需客户端重新提交。旧版 `event_saved_queue_unavailable` 503 响应已移除。
-
-## 积压上限与背压
-
-`MAX_PENDING_DELIVERIES` 默认 `10000`，必须是正整数，所有 API 实例配置一致。统计 `pending + processing + retrying` 投递；任务进入 Redis 不释放名额，只有 `succeeded` 或 `failed` 才释放。
-
-达到上限时，新事件返回 `503`、`Retry-After: 5` 和：
-
-```json
-{"error":"backlog_full","persisted":false}
-```
-
-这个响应明确表示本次请求没有创建事件、投递或 Outbox，可以保留同一幂等键稍后重试。5 秒只是重试建议，不保证届时有容量。已接受事件的相同内容重试仍返回 200；同键不同内容仍为 409。
-
-实现为数据库单行锁串行化“检查容量 + 三表写入”，事务采用 READ COMMITTED，锁后再次检查幂等。没有独立计数器，因此无需 Worker 维护增减计数；代价是新事件接入串行化、每次查询非终态数量，后续压测再优化。配置调低到现有积压以下不会删除已有任务，只暂停接收新事件。失败重放也经过同一容量检查，与新事件共享上限。
-
-## 查询投递
+### 5.6 查询状态与重放
 
 ```bash
-curl -i http://127.0.0.1:8080/v1/deliveries/1 -H "X-API-Key: $API_KEY"
-```
+# 查询投递状态
+curl http://127.0.0.1:8080/v1/deliveries/1 \
+  -H "X-API-Key: $API_KEY"
 
-使用提交事件响应中的 `delivery_id`。状态：`pending → processing → succeeded`；临时失败进入 `retrying`，永久错误或耗尽预算进入 `failed`。查询还返回 `recovery_count`（自接入或最近一次人工重放以来的自动恢复次数）。`attempt_count` 在领取时加一：崩溃发生在 HTTP 前也会占用预算，因此不是精确的远端接收次数。
+# 查询投递尝试历史
+curl 'http://127.0.0.1:8080/v1/deliveries/1/attempts?limit=20' \
+  -H "X-API-Key: $API_KEY"
 
-`internal/delivery/sender.go` 已实现单次 HTTP POST：原样发送 payload，携带稳定 `X-Webhook-ID`；2xx 成功，网络错误/超时/408/429/5xx 标记可重试，3xx 不跟随且视为永久失败，其余 4xx 不重试。Sender 使用调用方指定的 HTTP 超时，传递 context，最多读取 4 KiB 响应体以便连接复用。它不负责排队、自动重试或写数据库，对可重试响应提取单个 Retry-After 供 Worker 调度；重复响应头忽略。每次发送附带新的时间戳和 HMAC 签名，仅供受控本地测试。
-
-## HMAC 签名与验签
-
-协议实现：`internal/webhook/signature.go`，Worker 从端点配置传递密钥给 Sender，密钥不进入 Redis 任务。
-
-- `X-Webhook-ID`：稳定的十进制 delivery_id，自动重试及人工重放不变。
-- `X-Webhook-Timestamp`：当前尝试的 Unix 秒时间戳。
-- `X-Webhook-Signature`：`v1=` 加 HMAC-SHA256 的十六进制摘要。
-- 签名输入：`timestamp + "." + delivery_id + "." + 原始 payload 字节`。密钥为创建端点时 64 字符 hex 密钥**解码后的 32 字节**，不是 hex 字符串的 ASCII 字节。
-- 每次发送重新生成时间戳和签名；同一秒内重试可能得到相同签名。不能先重新序列化 JSON 再验签，空白变化也会导致验签失败。
-- Receiver 使用 `hmac.Equal` 比较摘要；时间戳允许前后各 5 分钟偏差，边界按秒计算。篡改、过期、超前、缺失或重复签名相关请求头返回 401，且不进入模拟处理。
-- Receiver 必须设置 `RECEIVER_SIGNING_SECRET`，缺省/格式错误拒绝启动；没有无签名兼容模式。请求体最多 256 KiB，超限 413，读请求超时 5 秒。验签成功后才执行 `-delay`、`-status`、`-retry-after` 模拟行为。
-- Sender 遇到非法本地密钥不发 HTTP；Worker 记录 `signing_error` 并最终失败。密钥格式合法但与 Receiver 不匹配，返回 401，按永久 HTTP 错误处理。
-- **签名不等于幂等，也不加密正文。** 时间窗口内有效请求仍可重复到达；接收方业务去重由独立数据库事务完成。非本地传输仍应使用 HTTPS。端点密钥目前明文保存在开发数据库，不提供轮换/加密存储能力。
-
-## 接收方持久化幂等
-
-实现位于 `internal/receiver/store.go` 和 `handler.go`：
-
-```text
-验签 → BEGIN → INSERT receiver_receipts(delivery_id 唯一, payload_hash)
-             → INSERT receiver_effects(模拟业务写入) → COMMIT → HTTP 响应
-```
-
-- 不先查再写，靠唯一约束裁决并发；任一写入失败，两条记录一起回滚。去重 INSERT 冲突后退出失败事务，再读取已提交摘要。
-- 相同 ID、相同原始正文返回 204，不重复写业务；相同 ID、不同正文返回 409，不覆盖原数据。数据库不可用/结果不确定返回 503，后续重试仍由唯一约束保护。
-- 每次重试仍需有效签名。自动重试、人工重放都保留 delivery_id，因此不会再次产生已提交的模拟业务效果；真正需要新效果时创建新事件。
-- `-status` 为 2xx 时，先提交事务，再按 `-delay` 延迟**首次**响应。客户端超时/断连不撤销已提交记录；重复请求跳过延迟直接 204。非 2xx 模式在业务写入前模拟错误。
-- 可用 `go run ./cmd/receiver -delay 8s` 演示：默认 Worker HTTP 超时 5 秒，第一次 timeout，第二次幂等成功。查询投递 attempts 应看到两次尝试；管理员查询 `SELECT delivery_id, COUNT(*) FROM receiver_effects GROUP BY delivery_id;`，每个 ID 只有一条业务记录。
-- 当前只模拟数据库内业务写入，**不保证发邮件、扣外部账户等外部副作用恰好一次**。验证包含真实数据库/队列和新连接池重读，尚未做接收端进程强杀或数据库灾难恢复测试。
-- 去重记录不自动过期；不要只清空 receipt 或重置平台数据库后复用同一个接收端库。去重键仅为 delivery_id，假设一个 HookRelay ID 命名空间，不支持多个独立平台共用该接收端数据集。模拟业务表保存原始 payload，仅用于受控测试。
-
-## HTTP 重试策略
-
-Worker 使用 `internal/delivery/retry.go` 的 `RetryPolicy.Delay` 作为 Asynq 的 `RetryDelayFunc`，不另建数据库重试调度器。
-
-- `RETRY_BASE_DELAY` 默认 `5s`，`RETRY_MAX_DELAY` 默认 `1m`；使用 Go duration 格式，要求 `0 < base <= max`。修改后重启 Worker。
-- HTTP 结果的重试序号 n 使用数据库本轮 `attempt_count - 1`；尚未领取的基础设施错误使用当前 Asynq 任务的重试计数。端点满额导致更换队列任务 ID 不会重置 HTTP 退避。退避上界为 `min(base × 2^n, max)`，在其一半到全部之间随机取值。默认前两次为 2.5～5 秒、5～10 秒；每轮最多 3 次领取的业务预算不变。
-- 网络错误、超时、408、429、5xx 可重试。合法 Retry-After 支持非负整数秒和 HTTP 日期，最终延迟取抖动结果与接收端建议的较大值，但不超过 max。过长值会被截断，因此不能保证遵守超过上限的接收端等待要求。
-- 空值、负数、小数、无效/过期日期和重复响应头不延长退避；2xx、3xx 和永久 4xx 不因该响应头而重试。有效但过大的整数按 max 处理，避免溢出。
-- 原始响应头只在内存中传给调度回调，不写日志、数据库或任务 payload。结果写库失败时也保留本次重试建议；后续执行仍受租约与业务预算约束。
-- 重试延迟只计算一次，与投递结果同事务保存最早重试时间。复用 `deliveries.lease_until`：processing 时表示执行租约，retrying 时表示重试等待截止时间；终态清空。重复任务或 Asynq 秒级取整导致的提前领取会延期，不新增历史或消耗投递预算。无需迁移；旧 retrying 记录没有等待截止时间，不追溯补算。
-- **最早重试时间不是精确发送时间。** Asynq 仍负责正常重试调度，数据库只在领取时检查，不扫描或主动入队。提前到达会触发 2～4 秒随机延期，扫描间隔、积压也会增加等待。比较使用 Worker 的 UTC 时钟，依赖时钟同步；结果写库失败时无法保证这次等待已持久化。
-- 配置仅控制 Worker 的任务重试，不改变 Dispatcher 的 Outbox 发布退避，也不同于 API 满载响应中的 `Retry-After: 5`。
-
-## 查询投递尝试历史
-
-```bash
-curl -s 'http://127.0.0.1:8080/v1/deliveries/1/attempts?limit=20' \
+# 重放 failed 投递
+curl -X POST http://127.0.0.1:8080/v1/deliveries/1/replay \
   -H "X-API-Key: $API_KEY"
 ```
 
-返回 `{"items":[...],"next_after":""}`。每条包含字符串 id/delivery_id、generation、attempt_number、status、started_at、finished_at、http_status、error_class、latency_ms。`next_after` 非空时将它作为下一页 `after`；默认每页 20，范围 1～100，跨 generation 按 ID 升序。不存在的投递返回 404，已有但未执行的投递返回空数组。
+## 6. API 概览
 
-- Worker 领取投递时，在同一事务中登记 processing 历史，然后才执行 HTTP；登记失败则领取状态/次数也回滚。
-- HTTP 结果和投递状态在同一事务中回写；已完成历史不被重复结果覆盖。旧请求晚到可以补全自己的未完成历史，但不能改变新执行的投递状态。
-- `finished_at=null` 表示结果尚未记录：可能正在执行，也可能已经崩溃或结果写回失败。**不代表 HTTP 一定没发送或远端没处理。** 没有自动推断为失败。
-- http_status 为 null 表示没有记录到 HTTP 响应；error_class 只保存固定分类（如 http_error、timeout、network_error），不保存原始 URL、payload 或错误详情。
-- started_at 是领取时刻，latency_ms 是 Sender 耗时。领取后发现 URL 不允许时仍留失败记录，latency_ms 为 null；端点禁用或预算已耗尽时根本不领取，不新增尝试。
-- 这是执行尝试历史，不是精确的远端请求计数；尚无历史清理策略。
+| Method | Path | 功能 |
+|---|---|---|
+| GET | `/healthz` | 存活检查 |
+| GET | `/readyz` | 数据库就绪检查 |
+| POST | `/v1/endpoints` | 创建接收端 |
+| GET | `/v1/endpoints/:id` | 查询接收端 |
+| PATCH | `/v1/endpoints/:id` | 启用或禁用接收端 |
+| POST | `/v1/events` | 幂等创建 Webhook 事件 |
+| GET | `/v1/deliveries/:id` | 查询投递状态 |
+| GET | `/v1/deliveries/:id/attempts` | 分页查询投递历史 |
+| POST | `/v1/deliveries/:id/replay` | 重放失败投递 |
 
-## 失败重放
+业务管理接口需携带 `X-API-Key`；提交事件还需 `Idempotency-Key`。
 
-先修复接收端问题，再对 failed 投递调用（替换为实际 delivery_id）：
+## 7. 测试
+
+运行不依赖数据库的测试：
 
 ```bash
-curl -i -X POST http://127.0.0.1:8080/v1/deliveries/9/replay \
-  -H "X-API-Key: $API_KEY"
+cd project/hookrelay
+go test ./...
 ```
 
-成功返回 202，例如：
+在仓库根目录执行时，请先进入上述项目目录。
 
-```json
-{"delivery_id":"9","event_id":"7","generation":2,"status":"pending"}
+推荐使用隔离集成测试脚本：
+
+```bash
+bash scripts/test-integration.sh
 ```
 
-- 同事务执行：接入锁 → 锁定投递并检查 failed → 检查端点启用/容量 → generation+1、attempt_count=0、recovery_count=0、清空队列任务 ID/最后错误/状态码/租约 → 新 Outbox。Outbox 写入失败则整轮回滚。
-- delivery_id、event_id、payload 不变，旧 Outbox 与尝试历史不删除；attempt_count 表示自首次接入或最近一次人工重放以来的累计领取次数。自动恢复也会递增 generation，但不重置 attempt_count；最多 3 次领取，只有人工再次重放才开启新预算。
-- 不存在返回 404；pending/processing/retrying/succeeded 返回 409 `delivery_not_replayable`；端点禁用返回 409 `endpoint_disabled`，需要先启用。
-- 满载返回 503、`Retry-After: 5`、`{"error":"backlog_full","replayed":false}`；原 failed 状态和 generation 不变，不生成新 Outbox。
-- 同一失败状态被并发请求时，只能创建一轮新执行。它不是带幂等键的重放接口：若新一轮后来又 failed，再 POST 会开启下一轮。请求超时/响应丢失时先查状态及 generation，不要盲目重复重放。
-- 旧任务被 generation 检查跳过；旧请求晚到只能补全旧历史，不能覆盖新一轮状态。已经发出的 HTTP 无法撤回，接收端仍需按稳定 delivery_id 幂等。若希望产生一次新的业务效果，应提交新事件，而不是重放。
-- 202 只表示重放事务提交，不表示已经入队或投递成功。可查询 delivery 状态和跨 generation 的 attempts 历史。
+该脚本使用独立的测试容器、随机本地端口和临时数据库，运行包含竞态检查的相关测试，并在退出时清理本次测试资源。
 
-## Outbox 发布流程
+覆盖范围包括 MySQL 事务、并发幂等、Outbox 故障、异步投递、重试、接收端去重、失败重放和自动恢复等。
+
+集成测试不应直接指向日常开发数据库或已有业务数据。
+
+## 8. 当前限制
+
+HookRelay 当前仍是以可靠性机制验证为主要目标的项目，存在以下限制：
+
+- **不是 Exactly-Once 系统**：任务可能重复入队，HTTP 可能重复发送；外部业务需要自行保证幂等。
+- **并发隔离范围有限**：端点并发配额只在单个 Worker 进程内生效，不支持全局公平调度。
+- **恢复存在边界**：Reconciler 需要单独运行，依赖宽限期、队列状态检查与恢复预算，不保证立即恢复。
+- **安全能力仍需完善**：目前端点密钥以明文存储于开发数据库，尚未提供密钥轮换或加密存储机制；非本地通信应使用 HTTPS。
+- **缺少完整性能基准**：尚未建立系统性的吞吐量、P95/P99 延迟和持续高负载测试报告。
+- **存储维护机制有限**：历史投递与 Outbox 数据尚无自动清理策略。
+- **故障验证尚未覆盖全部场景**：完整 Redis 数据丢失、进程强杀后的端到端恢复时延和多实例故障演练仍待补充。
+
+这些限制也构成了后续优化的主要方向。
+
+## 9. 后续计划
+
+- [ ] 增加投递吞吐量、成功率、队列积压及恢复次数等运行指标
+- [ ] 建立可复现的并发压测，记录吞吐量与 P95/P99 延迟
+- [ ] 验证 Worker 强杀、Redis 数据丢失及多实例故障场景
+- [ ] 优化积压容量检查中的数据库锁竞争与查询开销
+- [ ] 设计历史数据保留、清理及密钥管理机制
+- [ ] 探索跨 Worker 的全局端点并发限制
+
+## 10. 项目结构与相关文档
+
+核心代码位于 [`project/hookrelay`](./project/hookrelay)。
+
+主要执行入口：
 
 ```text
-API ──MySQL 事务──► events + deliveries + outbox
-                                            │
-                                      Dispatcher
-                                            │
-                                       Redis/Asynq
-                                            │
-                                          Worker → HTTP
+project/hookrelay/
+├── cmd/
+│   ├── api/
+│   ├── dispatcher/
+│   ├── worker/
+│   ├── reconciler/
+│   └── receiver/
+├── internal/
+├── migrations/
+├── scripts/
+├── tests/
+├── docs/
+├── compose.yaml
+└── go.mod
 ```
 
-Outbox 状态：`pending → processing → published`。领取用短事务和 30 秒租约，事务提交后才请求 Redis；入队失败回到 pending，按 5/10/20/40/60 秒退避。Redis 超时 5 秒，空闲每秒扫描一次。
+详细的环境恢复、数据库迁移和技术探索记录保留在项目的 `docs/` 文档中。
 
-`available_at` 在 pending 时表示下次重试时间，在 processing 时表示租约到期时间。Dispatcher 重启可重新领取过期记录；`publish_attempts` 是领取令牌，阻止旧发布者覆盖新状态。
+设计计划与可靠性边界参见 [`PLAN.md`](./project/hookrelay/PLAN.md)。
 
-入队成功但标记失败时允许重复发布，任务仍使用稳定 delivery_id/generation；已成功投递会由 Worker 跳过。**published 只表示入队已确认，不表示投递成功。** 这不是接收方业务的恰好一次保证。
+---
 
-## 单 Worker 端点并发限制
 
-```bash
-export WORKER_CONCURRENCY=4       # 当前进程总执行槽
-export ENDPOINT_CONCURRENCY=1     # 每个 endpoint_id 最多持有的执行许可
-go run ./cmd/worker
-```
-
-两项只由 Worker 读取，均为正整数，端点上限不得大于总并发；相等时会警告没有给其他端点留余量。默认从原来的串行改为 4 个执行槽。它与 API 的 `MAX_PENDING_DELIVERIES` 积压容量不是一回事。
-
-执行顺序：只读查询端点 ID → 尝试获取进程内许可 → 领取并登记历史 → HTTP → 保存结果 → 释放许可。终态/旧 generation 直接跳过；领取时仍重新校验数据库状态。许可覆盖领取到结果回写，退出、错误或 panic 均释放；空闲端点计数会删除。
-
-**端点满额时不阻塞等许可：** 通过 Asynq 先发布 2～4 秒随机延迟的替代任务，将返回的队列 ID 写入 `deliveries.queue_task_id` 并刷新 updated_at，再确认当前任务完成。不调用 Claim、不增加 attempt_count、不新增尝试历史、不改变业务状态。剩余普通重试预算作为新任务的 MaxRetry 传递，不能通过限流“补满”失败预算；业务每轮最多 3 次领取仍由数据库裁决。调度有秒级取整/扫描误差，不保证精确等待时间。
-
-为何不用普通错误 + `IsFailure=false`？Asynq v0.25.1 在重试上限处先归档，再检查 IsFailure；这会吃掉满额任务的最后一次机会。替代任务方案也能处理 MaxRetry(0)，但有如下边界：
-
-- 新队列任务使用新 Asynq ID，**delivery_id/generation 不变**；初始 Outbox 发布仍使用稳定队列 ID。对账优先检查已记录的替代任务 ID，没有记录时才使用初始 ID。
-- 发布成功但旧任务确认前崩溃可能重复入队，仍依赖数据库领取令牌与接收端幂等；发布失败不能确认旧任务，会走普通基础设施重试。Redis 长期故障、任务 ID 写库失败或最后一次发布失败仍可能遗留非终态记录；启用 Reconciler 后按下述规则受控恢复。
-- 配额按 **endpoint_id**，不是按 URL/域名；同 URL 的不同端点各有配额。只在单进程内生效，多 Worker 会叠加；请求超时后远端可能继续处理，本地许可不能限制远端仍在运行的业务。
-- 不是严格公平调度，也不保证等待上限：大量积压仍有查询/入队开销，热端点可能反复延期；当前没有最大延期次数或总等待期限。共享 MySQL/Redis 故障也不受此隔离保护。
-
-验证入口：`bash scripts/test-integration.sh`，其中 `TestEndpointIsolation` 使用 4 个槽、每端点 1 个许可，阻塞一个慢请求并积压 6 个同端点任务，再投递另一个端点。断言快端点在慢请求未释放时完成、重复延期不耗预算、慢端点峰值为 1、释放后全部成功。测试使用同一受控 URL 下两个端点 ID，不是跨域名隔离或吞吐压测；实际观测时间见学习记录。
-
-## 自动对账恢复（Reconciler）
-
-**升级要求：** 停止旧 API/Worker/Dispatcher，仅补平台迁移 `migrations/000006_add_delivery_recovery.up.sql`，再启动新版进程。前五份不要重跑。助手只在隔离测试库执行了 `000006`，没有修改开发库。确认尚未执行后，可用管理员运行一次：
-
-```bash
-docker compose exec -T mysql sh -c \
-  'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysql -uroot "$MYSQL_DATABASE"' \
-  < migrations/000006_add_delivery_recovery.up.sql
-```
-
-迁移增加 `queue_task_id`、`recovery_count` 和扫描索引。即使暂不启用 Reconciler，新版 API/Worker 也需要这些字段；Receiver 独立数据库无需改动。若执行失败，先检查表结构，勿盲目重跑或清库。
-
-恢复功能作为独立进程运行，不会随 API 自动启动。在加载平台 `MYSQL_*`、`REDIS_ADDR` 后另开终端：
-
-```bash
-export RECONCILE_GRACE=5m RECONCILE_INTERVAL=30s
-export RECONCILE_BATCH_SIZE=100 MAX_DELIVERY_RECOVERIES=3
-go run ./cmd/reconciler
-```
-
-以上为默认值：宽限期至少 1 分钟，扫描间隔为正数，每批 1～1000 条，恢复上限为正整数。默认每 30 秒扫描一批，用 ID 游标遍历，避免低 ID 的健康积压让后续记录一直得不到检查。等待时间还受批次和积压影响，不承诺恰好 5 分钟恢复。仍按单实例运行。
-
-核心流程：
-
-1. 只检查 pending/processing/retrying，且当前 generation 的 Outbox 已 published。最后活动、发布确认和租约/重试等待到期时间都必须越过宽限期；未发布 Outbox 留给 Dispatcher。
-2. 在数据库事务外检查记录的队列任务 ID。pending、active、scheduled、retry 等仍存活的任务直接跳过，即使队列暂停；只有明确不存在、archived 或 completed 才进入恢复。Redis 查询错误不当作丢失。
-3. 短事务锁定投递，重新校验 generation、尝试次数、恢复次数、队列 ID 和 updated_at；检查期间若有 Worker/延期活动则放弃本次恢复。
-4. 同事务执行 generation+1、recovery_count+1、回到 pending、创建新 Outbox；**保留 attempt_count、稳定 delivery_id 和历史，不直接请求 Redis**。旧任务不能领取新一代，旧结果只能补自己的历史，不能覆盖恢复后的状态。
-5. 已耗尽 3 次业务领取或自动恢复上限时置 failed，分别记录 `attempts_exhausted` / `recovery_exhausted`；generation 无法递增时记录 `generation_exhausted`。前两种失败可按原 API 人工重放并重置两种预算；generation 已到上限则不能再重放。
-
-自动恢复的 generation 是新的执行版本，不等于新的投递预算；该版本的首条历史 attempt_number 可能不是 1。`GET /v1/deliveries/:id` 返回 recovery_count 便于诊断。
-
-边界：保存的是最近已知队列 ID，不是所有重复任务的完整索引。入队成功但记录 ID 前崩溃、升级前未追踪的延期任务或并发重复任务，仍可能导致恢复时替换一个尚存的旧任务；generation 和总尝试预算限制其影响。无法撤回已发出的 HTTP，仍需要接收方幂等。时间判断依赖 Worker/Reconciler 时钟同步；恢复不是严格的恰好一次保证。
-
-本轮仅做重点验证：隔离 MySQL 8.4/Redis 7.4 下删除一个已发布任务后恢复并完成 HTTP，覆盖存活延期任务跳过、归档恢复、快照变化跳过、查询错误不恢复、Outbox 失败回滚、旧结果隔离和预算耗尽；未做整库 FLUSH、进程强杀或多实例演练。测试入口为 `TestRecovery`（需专用空库和六份迁移）；现有 `scripts/test-integration.sh` 会创建隔离环境并包含它。
-
-## Worker 与当前限制
-
-- 任务类型 `webhook:deliver`，队列 `webhooks`，payload 仅含 delivery_id 与 generation。初始发布用稳定队列任务 ID 抑制重复；端点延期使用新队列 ID，已终态或旧 generation 由数据库跳过。
-- 当前默认：单进程、总并发 4、每端点并发 1，最多 3 次领取，HTTP 超时 5 秒、任务超时 20 秒、执行租约 30 秒。次数及超时集中于 `internal/task/delivery.go`；退避通过上述环境变量配置，由 Asynq 调度，数据库负责状态与预算。
-- 领取使用短事务；发送不持有事务；回写校验 generation 和 attempt_count。租约过期仍可能重复发送，不能保证外部业务恰好一次。
-- 遇到仍有效的执行租约或尚未到期的重试等待时，复用延迟替换任务机制，不把等待算作普通重试或新增投递尝试；替换入队失败仍返回错误，不提前确认原任务。
-- HTTP 继续遵循任务取消；结果回写使用独立的 5 秒限时上下文，避免任务取消直接丢掉已获得的 HTTP 结果。回写失败仍交给队列重试；进程强杀或数据库持续不可用仍可能留下未完成历史。该回写逻辑本身无需迁移；本轮自动恢复升级仍需 `000006`。
-- 已保存但未入队的记录由 Outbox 恢复。**已 published 后 Redis 丢失任务不是 Outbox 单独能恢复的**；需额外运行 Reconciler，且仍受宽限期、队列检查和恢复预算约束。
-- 容量限制针对未完成投递数量，不是总数据量或 Redis 内存限制；终态事件和 Outbox 历史仍会累积，目前没有清理机制。
-- Reconciler 未运行或依赖长期不可用时仍可能遗留非终态记录；它也不会强行接管队列中仍存活的任务。Worker 强杀恢复时间、完整 Redis 清空及多实例故障验证尚未完成。
-- 已有 HMAC、验签、接收端同库事务幂等与单进程端点配额；暂无跨 Worker 全局并发隔离。接收端示例不保证数据库之外的业务副作用恰好一次。
-
-## 下一步
-
-自动对账核心已实现，下一步补基础运行指标；Worker 强杀后的实际恢复等待时间、完整 Redis 数据丢失与多实例故障演练仍待验证，
