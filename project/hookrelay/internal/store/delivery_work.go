@@ -11,6 +11,16 @@ import (
 
 var ErrDeliveryBusy = errors.New("delivery lease or retry cooldown is active")
 
+// DeliveryBusyError carries the durable gate so callers can schedule one wait
+// rather than poll an active lease/cooldown every few seconds. Claim still checks
+// the gate again when the replacement runs; it may have changed in the meantime.
+type DeliveryBusyError struct {
+	Until time.Time
+}
+
+func (e *DeliveryBusyError) Error() string { return ErrDeliveryBusy.Error() }
+func (e *DeliveryBusyError) Unwrap() error { return ErrDeliveryBusy }
+
 type DeliveryWork struct {
 	AttemptID uint64
 	Delivery  Delivery
@@ -57,7 +67,7 @@ func (s DeliveryStore) Claim(ctx context.Context, id uint64, generation uint32, 
 		// This also fences duplicate queue tasks that arrive before Asynq's
 		// delayed retry, without consuming another attempt or history row.
 		if d.LeaseUntil != nil && d.LeaseUntil.After(now) {
-			return ErrDeliveryBusy
+			return &DeliveryBusyError{Until: *d.LeaseUntil}
 		}
 		var event Event
 		if err := tx.Where("id = ?", d.EventID).Take(&event).Error; err != nil {

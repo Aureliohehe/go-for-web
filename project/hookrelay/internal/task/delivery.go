@@ -43,19 +43,34 @@ func (c *Client) Close() error { return c.client.Close() }
 // receiver idempotency still protect execution. The caller must persist the
 // returned queue task ID before acknowledging the original task.
 func (c *Client) DeferDelivery(ctx context.Context, id uint64, generation uint32) (string, error) {
+	return c.DeferDeliveryUntil(ctx, id, generation, time.Time{})
+}
+
+// DeferDeliveryUntil schedules after both now and the observed database gate,
+// with jitter to spread waiters. A zero/past gate is ordinary endpoint deferral.
+// No attempt budget is consumed by waiting, or replenished by the replacement.
+func (c *Client) DeferDeliveryUntil(ctx context.Context, id uint64, generation uint32, notBefore time.Time) (string, error) {
 	queue, hasQueue := asynq.GetQueueName(ctx)
 	max, hasMax := asynq.GetMaxRetry(ctx)
 	retried, hasRetried := asynq.GetRetryCount(ctx)
-	if !hasQueue || !hasMax || !hasRetried || retried > max {
+	if !hasQueue || queue == "" || !hasMax || !hasRetried || max < 0 || retried < 0 || retried > max {
 		return "", errors.New("missing or invalid Asynq deferral context")
 	}
 	body, err := json.Marshal(Payload{DeliveryID: id, Generation: generation})
 	if err != nil {
 		return "", err
 	}
-	delay := 2*time.Second + time.Duration(rand.Int64N(int64(2*time.Second)))
+	base := time.Now()
+	if notBefore.After(base) {
+		base = notBefore
+	}
+	processAt := base.Add(2*time.Second + time.Duration(rand.Int64N(int64(2*time.Second))))
+	// Asynq persists Unix seconds. Round upward, never schedule before the gate.
+	if rounded := processAt.Truncate(time.Second); rounded.Before(processAt) {
+		processAt = rounded.Add(time.Second)
+	}
 	info, err := c.client.EnqueueContext(ctx, asynq.NewTask(TypeDelivery, body),
-		asynq.Queue(queue), asynq.MaxRetry(max-retried), asynq.Timeout(TaskTimeout), asynq.ProcessIn(delay))
+		asynq.Queue(queue), asynq.MaxRetry(max-retried), asynq.Timeout(TaskTimeout), asynq.ProcessAt(processAt))
 	if err != nil {
 		return "", err
 	}

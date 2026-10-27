@@ -48,6 +48,9 @@ func run(ctx context.Context) error {
 	slog.Info("mysql connected")
 
 	gin.SetMode(gin.ReleaseMode)
+	metrics := handler.NewMetrics(func(ctx context.Context) (store.MetricsSnapshot, error) {
+		return store.CollectMetrics(ctx, db)
+	}, cfg.MaxPendingDeliveries)
 	router := handler.NewAPIRouter(
 		pool.PingContext,
 		cfg.APIKey,
@@ -61,9 +64,9 @@ func run(ctx context.Context) error {
 		func(ctx context.Context, id uint64, enabled bool) (store.Endpoint, error) {
 			return store.SetEndpointEnabled(ctx, db, id, enabled)
 		},
-		func(ctx context.Context, input store.EventInput) (store.EventResult, error) {
+		metrics.ObserveEvents(func(ctx context.Context, input store.EventInput) (store.EventResult, error) {
 			return store.CreateOrGetEventDelivery(ctx, db, input, cfg.MaxPendingDeliveries)
-		},
+		}),
 		func(ctx context.Context, id uint64) (store.Delivery, error) {
 			return store.FindDelivery(ctx, db, id)
 		},
@@ -74,6 +77,12 @@ func run(ctx context.Context) error {
 			return store.ReplayDelivery(ctx, db, id, cfg.MaxPendingDeliveries)
 		},
 	)
+	router.GET("/metrics", handler.RequireAPIKey(cfg.APIKey), metrics.Get)
+	router.GET("/v1/deliveries", handler.RequireAPIKey(cfg.APIKey), handler.GetDeliveries(
+		func(ctx context.Context, filter store.DeliveryFilter) ([]store.Delivery, error) {
+			return store.ListDeliveries(ctx, db, filter)
+		},
+	))
 	if err := router.SetTrustedProxies(nil); err != nil {
 		return fmt.Errorf("configure trusted proxies: %w", err)
 	}

@@ -28,17 +28,23 @@ func GetDelivery(find DeliveryFinder) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal_error"})
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{
-			"id":               strconv.FormatUint(delivery.ID, 10),
-			"event_id":         strconv.FormatUint(delivery.EventID, 10),
-			"status":           delivery.Status,
-			"generation":       delivery.Generation,
-			"attempt_count":    delivery.AttemptCount,
-			"recovery_count":   delivery.RecoveryCount,
-			"last_http_status": delivery.LastHTTPStatus,
-			"last_error":       delivery.LastError,
-			"created_at":       delivery.CreatedAt,
-			"updated_at":       delivery.UpdatedAt,
-		})
+		c.JSON(http.StatusOK, deliveryJSON(delivery))
+	}
+}
+
+// Keep list and detail responses identical; never serialize the storage model
+// directly (queue task IDs and execution leases are internal implementation data).
+func deliveryJSON(delivery store.Delivery) gin.H {
+	return gin.H{
+		"id":               strconv.FormatUint(delivery.ID, 10),
+		"event_id":         strconv.FormatUint(delivery.EventID, 10),
+		"status":           delivery.Status,
+		"generation":       delivery.Generation,
+		"attempt_count":    delivery.AttemptCount,
+		"recovery_count":   delivery.RecoveryCount,
+		"last_http_status": delivery.LastHTTPStatus,
+		"last_error":       delivery.LastError,
+		"created_at":       delivery.CreatedAt,
+		"updated_at":       delivery.UpdatedAt,
 	}
 }

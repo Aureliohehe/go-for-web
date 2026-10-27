@@ -51,7 +51,7 @@ func run(ctx context.Context) error {
 	retryPolicy := delivery.RetryPolicy{BaseDelay: cfg.RetryBaseDelay, MaxDelay: cfg.RetryMaxDelay}
 	worker := delivery.Worker{
 		Store: store.DeliveryStore{DB: db}, Send: delivery.NewSender(task.HTTPTimeout).Send, AllowedURL: cfg.AllowedEndpointURL,
-		Limiter: delivery.NewEndpointLimiter(limits.EndpointConcurrency), Defer: client.DeferDelivery, RetryPolicy: retryPolicy,
+		Limiter: delivery.NewEndpointLimiter(limits.EndpointConcurrency), DeferUntil: client.DeferDeliveryUntil, RetryPolicy: retryPolicy,
 	}
 	server := asynq.NewServer(asynq.RedisClientOpt{Addr: cfg.RedisAddr}, asynq.Config{
 		Concurrency:     limits.Concurrency,

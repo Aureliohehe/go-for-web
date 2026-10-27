@@ -12,6 +12,7 @@ import (
 const (
 	LeaseDuration  = 30 * time.Second
 	PublishTimeout = 5 * time.Second
+	ResultTimeout  = 5 * time.Second
 	PollInterval   = time.Second
 )
 
@@ -36,14 +37,20 @@ func (d Dispatcher) DispatchOne(ctx context.Context) (bool, error) {
 	publishCtx, cancel := context.WithTimeout(ctx, PublishTimeout)
 	err = d.Enqueue(publishCtx, entry.DeliveryID, entry.Generation)
 	cancel()
+	// Enqueue still honors shutdown. Persist its observed result independently:
+	// cancellation immediately after Redis accepts a task must not prevent the
+	// acknowledgement. The lease/attempt token fences late writes, and failed
+	// persistence remains recoverable through lease expiry.
+	resultCtx, finish := context.WithTimeout(context.WithoutCancel(ctx), ResultTimeout)
+	defer finish()
 	if err != nil {
-		if err := d.Store.Retry(ctx, entry, retryDelay(entry.PublishAttempts)); err != nil {
+		if err := d.Store.Retry(resultCtx, entry, retryDelay(entry.PublishAttempts)); err != nil {
 			return true, err
 		}
 		slog.Warn("outbox enqueue failed", "outbox_id", entry.ID, "delivery_id", entry.DeliveryID)
 		return true, errors.New("outbox enqueue failed; retry scheduled")
 	}
-	if err := d.Store.Published(ctx, entry); err != nil {
+	if err := d.Store.Published(resultCtx, entry); err != nil {
 		return true, err
 	}
 	slog.Info("outbox published", "outbox_id", entry.ID, "delivery_id", entry.DeliveryID, "generation", entry.Generation)

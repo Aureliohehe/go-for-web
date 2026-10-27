@@ -32,6 +32,10 @@ type Worker struct {
 	// delivery lease or retry cooldown before acknowledgement. It must preserve the
 	// queue and remaining Asynq retry budget.
 	Defer func(context.Context, uint64, uint32) (string, error)
+	// DeferUntil is preferred when set; it also receives the observed lease or
+	// cooldown deadline. Zero means endpoint saturation without a known deadline.
+	// Defer remains a fallback for callers that only support short deferrals.
+	DeferUntil func(context.Context, uint64, uint32, time.Time) (string, error)
 }
 
 func (w Worker) ProcessTask(ctx context.Context, t *asynq.Task) error {
@@ -49,7 +53,7 @@ func (w Worker) ProcessTask(ctx context.Context, t *asynq.Task) error {
 		}
 		release, ok := w.Limiter.TryAcquire(id)
 		if !ok {
-			return w.deferTask(ctx, payload)
+			return w.deferTask(ctx, payload, time.Time{})
 		}
 		defer release() // Also releases on Claim/Finish errors, cancellation or panic.
 	}
@@ -58,7 +62,12 @@ func (w Worker) ProcessTask(ctx context.Context, t *asynq.Task) error {
 		// A duplicate task or a previous attempt whose result could not be saved
 		// may still own the lease. The last result may also impose a retry
 		// cooldown. Neither wait should exhaust the queue retry budget.
-		return w.deferTask(ctx, payload)
+		var until time.Time
+		var busy *store.DeliveryBusyError
+		if errors.As(err, &busy) {
+			until = busy.Until
+		}
+		return w.deferTask(ctx, payload, until)
 	}
 	if err != nil {
 		return errors.New("claim delivery failed")
@@ -128,17 +137,26 @@ func (w Worker) ProcessTask(ctx context.Context, t *asynq.Task) error {
 	return nil
 }
 
-func (w Worker) deferTask(ctx context.Context, payload task.Payload) error {
-	if w.Defer == nil {
+func (w Worker) deferTask(ctx context.Context, payload task.Payload, notBefore time.Time) error {
+	var queueID string
+	var err error
+	switch {
+	case w.DeferUntil != nil:
+		queueID, err = w.DeferUntil(ctx, payload.DeliveryID, payload.Generation, notBefore)
+	case w.Defer != nil:
+		queueID, err = w.Defer(ctx, payload.DeliveryID, payload.Generation)
+	default:
 		return errors.New("defer delivery failed")
 	}
-	queueID, err := w.Defer(ctx, payload.DeliveryID, payload.Generation)
 	if err != nil || queueID == "" {
 		return errors.New("defer delivery failed")
 	}
-	// Never acknowledge until both enqueue and task tracking succeed. A crash
-	// between them can duplicate tasks; recovery fences the old generation.
-	if err := w.Store.TrackTask(ctx, payload.DeliveryID, payload.Generation, queueID); err != nil {
+	// Never acknowledge until both enqueue and task tracking succeed. Once Redis
+	// has accepted the replacement, cancellation must not discard its identity.
+	// A crash between them can still duplicate tasks; recovery fences generations.
+	trackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), task.ResultTimeout)
+	defer cancel()
+	if err := w.Store.TrackTask(trackCtx, payload.DeliveryID, payload.Generation, queueID); err != nil {
 		return errors.New("save deferred task failed")
 	}
 	// No attempt/history write, HTTP send or ordinary retry is consumed.

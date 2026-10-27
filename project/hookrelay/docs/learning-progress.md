@@ -1,7 +1,45 @@
 # 学习进度与下次起点
 
 > 已完成接收端创建→查询及 PATCH 启用/禁用的真实 HTTP + MySQL 验证（用户反馈通过）。
-> 当前已实现 Outbox、背压、尝试历史、失败重放、HTTP 重试、HMAC 及接收端事务性持久化幂等。Docker 本轮已恢复，重试/签名/超时重投已通过隔离 MySQL 8.4/Redis 7.4 验证。平台五份迁移勿重复导入；**新增接收端迁移 `migrations/receiver/000001_create_receipts.up.sql` 只应用到独立接收端数据库，目前仅在隔离测试库执行，用户环境待配置。** Receiver 需要 `RECEIVER_SIGNING_SECRET` 和 `RECEIVER_MYSQL_*`。单 Worker 端点并发限制与慢端点隔离也已实现并验证；默认总并发 4、每端点 1。**最新：已实现保守自动对账，新增平台 `000006_add_delivery_recovery.up.sql` 只在隔离测试库执行，开发库尚未执行；升级前须补该迁移，再运行 `cmd/reconciler`。** 单任务丢失/归档恢复已验证，强杀及完整 Redis 清空仍未验证。
+> 当前已实现 Outbox、背压、尝试历史、失败重放、HTTP 重试、HMAC 及接收端事务性持久化幂等。Docker 本轮已恢复，重试/签名/超时重投已通过隔离 MySQL 8.4/Redis 7.4 验证。平台五份迁移勿重复导入；**新增接收端迁移 `migrations/receiver/000001_create_receipts.up.sql` 只应用到独立接收端数据库，目前仅在隔离测试库执行，用户环境待配置。** Receiver 需要 `RECEIVER_SIGNING_SECRET` 和 `RECEIVER_MYSQL_*`。单 Worker 端点并发限制与慢端点隔离也已实现并验证；默认总并发 4、每端点 1。**最新：已实现保守自动对账，新增平台 `000006_add_delivery_recovery.up.sql` 只在隔离测试库执行，开发库尚未执行；升级前须补该迁移，再运行 `cmd/reconciler`。** 单任务丢失/归档恢复已验证；最新隔离联调又完成 Worker 强杀恢复，完整 Redis 清空和多实例故障仍未验证。
+
+## 最新验证：隔离联调与 Worker 强杀恢复
+
+- 用户同意先验证主链路。未新增/修改项目测试文件、未运行 `go test`；只在临时目录放置联调驱动与精确取消探针。未读 `.env`、操作开发库或既有服务，无业务代码变更。
+- Docker WSL 接口当前不可用，改用本机 MySQL 8.0.42 和临时构建、核对官方哈希的 Redis 7.4.2；随机回环端口、全新数据目录和平台/Receiver 两个空库。迁移仅导入这两个临时库，开发环境待办不变。
+- 真实进程链路通过：500 三次后失败，失败列表按状态/端点筛选并分页、参数和鉴权校验、历史查询、人工重放成功、幂等复用/冲突、指标 SQL 与关键数值核对。
+- 429/Retry-After=20 后注入提前到达的重复任务，替代任务计划时间在 DB 截止之后 4.834 秒，尝试数/历史不增加，剩余普通重试预算保留；精确在 Redis 入队成功后取消上下文，Worker 仍保存替代任务 ID，Dispatcher 仍将 Outbox 标为 published。
+- 删除一个已发布任务后，Reconciler 约 **61.68 秒**恢复成功：generation=2、recovery_count=1、attempt_count=1。采用宽限 1 分钟、扫描 1 秒，不是默认参数时限。
+- Receiver 已提交但尚未响应时 SIGKILL 本轮 Worker，重启后约 **65.30 秒**成功：generation=1、recovery_count=0、attempt_count=2，说明由 Asynq 恢复；保留第一条未知历史，接收端业务仅 1 条。
+- 结束时投递和 Outbox 积压为 0、未知历史为 1；所有本轮临时进程已退出，并核对无遗留监听。完整结果与边界见 [联调记录](manual-validation.md)，临时证据 `/tmp/hookrelay-manual-MT5472`。
+- 尚未覆盖完整 Redis 清空、多实例故障、持续数据库故障、Receiver 强杀、大数据量性能或实际 Prometheus 抓取配置。下一步先推进完整 Redis 丢失与多实例演练，不据单次结果承诺恢复上限。
+
+## 前轮实现：投递筛选列表与人工排障闭环
+
+- 新增受 API Key 保护的 `GET /v1/deliveries`，支持 status、endpoint_id 筛选及 after/limit 游标分页。先找失败投递，再使用既有历史查询和人工重放，不需要预先保存全部投递 ID。
+- `internal/handler/delivery_list.go` 校验参数，拒绝未知/重复参数与无效编码；默认每页 20、最多 100，查询限时 3 秒。`internal/store/delivery_list.go` 使用参数化筛选、`id > after`、升序和 limit+1，不做 OFFSET/COUNT；按端点筛选时只关联事件 ID，不读 payload 或端点密钥。
+- 列表和详情共用 `deliveryJSON` 公开字段。响应为 items/next_after，空列表为 []，没有下一页为 ""；不存在的端点返回空列表。列表只读，不自动重放或锁定业务记录。
+- 实时状态变化可能让游标后续页遗漏后来才进入筛选状态的旧 ID；需从 0 开始新扫描。复用现有索引，无新迁移，尚未验证大数据量查询性能。
+- `cmd/api/main.go` 完成生产路由组装，README 补请求示例、错误码和分页边界。未修改或运行测试；`go build ./...`、`go vet ./...`、`git diff --check` 通过，真实 HTTP/MySQL 运行验证待补。未读 `.env`、操作数据库、启停服务或提交代码。
+
+## 上轮增量：按截止时间延期与替代任务 ID 回写
+
+- 继续沿用“完善核心逻辑，暂不写测试”。保留上轮未提交修改，不读 `.env`、不操作数据库或服务，无新增迁移。
+- `internal/store/delivery_work.go`：`Claim` 的忙碌错误现在携带数据库 `lease_until`，同时保留 `errors.Is(err, ErrDeliveryBusy)` 兼容性。仍在事务内校验，不消耗尝试预算。
+- `internal/delivery/worker.go` → `internal/task/delivery.go`：忙碌时提取截止时间，替代任务按 `max(now, until) + 2～4 秒抖动` 调度并向上取整到秒；端点满额无已知截止时间时仍短延迟。减少长租约/重试等待中的无效轮询，不保证精确唤醒，实际领取仍重验状态和截止时间。
+- `cmd/worker` 使用新 `DeferUntil` 回调；旧 `Defer`/`DeferDelivery` 接口保留作短延期兼容入口。替代任务仍保留原队列、delivery_id、generation 和剩余普通重试预算，不补满预算，不制造尝试历史。
+- Redis 入队保留取消传播，成功后 `TrackTask` 改用独立 5 秒上下文；只有入队和 ID 回写都成功才返回成功。取消期间不主动放弃已接受替代任务的 ID，但强杀/数据库故障仍可能造成重复或触发对账。
+- 验证：`go build ./...`、`go vet ./...`、`git diff --check` 通过；未新增、修改或运行测试，未实测 Redis 调度及取消时序。后续需补这两处验证，再做强杀和完整 Redis 丢失演练。
+
+## 上轮增量：基础指标与 Dispatcher 取消回写
+
+- 按本次要求先完善实现，**不新增或运行测试**；没有读取 `.env`、连接业务数据库、执行迁移、启停服务或提交代码。
+- `internal/store/metrics.go`：只读 REPEATABLE READ 事务采集事件总数、投递/Outbox 各状态数量及最老未完成年龄、已结束尝试结果与耗时、未知结果尝试数量。基于现有表，无新迁移。
+- `internal/handler/metrics.go`：用固定 outcome 标签统计 API 存储接入结果和耗时；注册受 API Key 保护的 `/metrics`，输出 Prometheus 文本。接入计数为单进程 counter，DB 数据为共享 gauge，不混淆当前投递状态和历史成功总数。
+- 请求链路：事件 handler → 接入观测包装 → 原有存储事务 → 记录结果/耗时；抓取链路：API Key 鉴权 → 单进程采集许可 → 2 秒限时 DB 快照 → 完整输出。并发采集和 DB 错误返回 503，不泄露底层错误或发布不完整指标。非法 JSON/鉴权拒绝不进入存储接入计数。
+- `internal/outbox/dispatcher.go`：发布仍使用原始取消上下文；发布返回后，Published/Retry 用独立 5 秒上下文写回，避免进程退出刚好发生在 Redis 成功之后时直接丢弃确认。原有租约和 publish_attempts 防止旧执行覆盖新结果，仍是至少一次语义。
+- 验证：`go build ./...`、`go vet ./...`、`git diff --check` 通过。**尚未实测 MySQL 指标 SQL、Prometheus 抓取和 Dispatcher 取消时序**，不把编译通过描述为运行验证。
+- 下一步：先验证指标和取消回写，再按需做 Worker 强杀、完整 Redis 清空与多实例恢复；用户开发库 `000006` 和 Receiver 独立配置的待办不变。指标聚合扫描历史，仅适合当前演示规模，多 API 的共享 DB gauge 不可求和。
 
 ## 辅导方式与协作约定
 
@@ -308,7 +346,7 @@ git diff --check
 - 按用户要求仅做关键验证：delivery/task 单测、全项目构建、相关包 vet 通过；隔离 MySQL 8.4/Redis 7.4 下运行 `TestDeliveryWorkIntegration` 与 `TestAsyncDelivery/(rate-limited|exhausted)` 通过，临时容器已清理。本轮未跑完整故障矩阵或强杀实验。
 - 边界：时间检查依赖 Worker 时钟同步；写库失败无法保证本次等待已持久化。当时自动对账尚未实现，后续实现见下一节；跨进程配额仍未实现。
 
-## 保守自动对账恢复（当前最新）
+## 保守自动对账恢复
 
 - 新增 `cmd/reconciler`、`internal/reconcile` 和存储恢复事务。默认宽限 5 分钟，每 30 秒扫 100 条，最多自动恢复 3 次。扫描用 ID 游标；未发布 Outbox、活跃租约/重试等待、近期活动及队列中仍存活的任务不恢复，Redis 查询错误不视作丢失。
 - Worker 延期入队后先落库队列任务 ID，再确认原任务。当前 generation 的 Outbox 已发布且 tracked task 明确缺失/归档/完成时，短事务重验快照 → generation+1、recovery_count+1、pending → 新 Outbox。Redis 检查不持有数据库事务。自动恢复不重置 attempt_count，旧结果只允许补自身历史；耗尽业务或恢复预算则 failed，人工重放才重置两种预算。
